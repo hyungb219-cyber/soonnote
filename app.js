@@ -40,8 +40,11 @@ let settings = loadSettings();
 
 // ---------- IndexedDB ----------
 const dbp = new Promise((ok, no) => {
-  const r = indexedDB.open('soonnote', 1);
-  r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('meetings', { keyPath: 'id' }); d.createObjectStore('audio'); };
+  const r = indexedDB.open('soonnote', 2);
+  r.onupgradeneeded = () => { const d = r.result;
+    if (!d.objectStoreNames.contains('meetings')) d.createObjectStore('meetings', { keyPath: 'id' });
+    if (!d.objectStoreNames.contains('audio')) d.createObjectStore('audio');
+    if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv'); };
   r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
 });
 async function idb(store, mode, fn) {
@@ -53,7 +56,12 @@ async function idb(store, mode, fn) {
 }
 // 같은 모임은 화면·녹음기·워커가 항상 같은 객체를 쓰도록 캐시한다
 const mcache = new Map();
-const saveMeeting = m => { m.updatedAt = Date.now(); mcache.set(m.id, m); return idb('meetings', 'readwrite', st => st.put(structuredClone(m))); };
+// quiet: 폴더 자동 저장을 다시 부르지 않음 (폴더 저장 자체가 남기는 기록용)
+const saveMeeting = (m, quiet) => { m.updatedAt = Date.now(); mcache.set(m.id, m);
+  if (!quiet) Folder.schedule(m);
+  return idb('meetings', 'readwrite', st => st.put(structuredClone(m))); };
+const kvGet = k => idb('kv', 'readonly', st => st.get(k));
+const kvSet = (k, v) => idb('kv', 'readwrite', st => v === undefined ? st.delete(k) : st.put(v, k));
 const getMeeting = async id => { if (mcache.has(id)) return mcache.get(id); const m = await idb('meetings', 'readonly', st => st.get(id)); if (m) mcache.set(id, m); return m; };
 const allMeetings = async () => (await idb('meetings', 'readonly', st => st.getAll())).map(m => mcache.get(m.id) || m);
 const putAudio = (key, blob) => idb('audio', 'readwrite', st => st.put(blob, key));
@@ -532,6 +540,99 @@ function applyShareCode(code) {
   saveSettings(settings);
 }
 
+// ---------- 폴더 저장 (노트북 Chrome/Edge: 선택한 폴더에 직접 저장 → Google Drive 동기화) ----------
+// 주차별 폴더 "9 27" 안에 순모임노트_2026-09-27.md(읽기용) + .json(앱 데이터)을 저장한다.
+// 폰에서 Drive 앱으로 올린 파일(…_data.txt)은 "폰 파일 폴더"에서 읽어 와 같은 곳에 정리한다.
+const canPickFolder = 'showDirectoryPicker' in window;
+const FILE_RE = /^순모임노트_.*(\.json|_data\.txt)$/;
+const dirNameOf = m => { const [, mo, d] = m.date.split('-'); return `${+mo} ${+d}`; };
+async function fileBaseOf(m) {
+  // 같은 날 모임이 여럿이면 _2, _3 을 붙인다 (먼저 만든 모임이 이름 없이)
+  const same = (await allMeetings()).filter(x => x.date === m.date && x.id !== m.id && x.createdAt < m.createdAt).length;
+  return `순모임노트_${m.date}${same ? '_' + (same + 1) : ''}`;
+}
+const meetingFileJSON = m => JSON.stringify({ type: 'soonnote-meeting', version: 1, meeting: m }, null, 1);
+async function writeText(dir, name, text) { const fh = await dir.getFileHandle(name, { create: true }); const w = await fh.createWritable(); await w.write(text); await w.close(); }
+const hasContent = m => m.prep || m.final || (m.rawNotes || '').trim() || (m.segments || []).some(s => s.utterances?.length);
+
+const Folder = {
+  main: null, inbox: null, ok: { main: false, inbox: false }, timers: {},
+  mode: k => k === 'main' ? 'readwrite' : 'read',
+  async init() {
+    if (!canPickFolder) return;
+    this.main = await kvGet('dir.main') || null; this.inbox = await kvGet('dir.inbox') || null;
+    for (const k of ['main', 'inbox']) if (this[k]) { try { this.ok[k] = (await this[k].queryPermission({ mode: this.mode(k) })) === 'granted'; } catch { this.ok[k] = false; } }
+    if (this.ready()) this.pullAll().then(n => n && View.homeIfShown());
+  },
+  ready() { return !!(this.main && this.ok.main); },
+  needsGrant() { return !!((this.main && !this.ok.main) || (this.inbox && !this.ok.inbox)); },
+  // 브라우저는 앱을 다시 열 때마다 폴더 권한을 한 번 확인한다 (버튼 클릭 필요)
+  async grant() {
+    for (const k of ['main', 'inbox']) if (this[k] && !this.ok[k]) this.ok[k] = (await this[k].requestPermission({ mode: this.mode(k) })) === 'granted';
+    const n = await this.pullAll(); await this.pushAll(); return n;
+  },
+  async pick(kind) {
+    const h = await showDirectoryPicker({ id: 'soonnote-' + kind, mode: this.mode(kind), startIn: 'documents' });
+    this[kind] = h; this.ok[kind] = true; await kvSet('dir.' + kind, h);
+    const n = await this.pullAll(); if (kind === 'main') await this.pushAll(); return n;
+  },
+  async forget(kind) { this[kind] = null; this.ok[kind] = false; await kvSet('dir.' + kind, undefined); },
+  schedule(m) {
+    if (!this.ready() || m.status === 'recording' || !hasContent(m)) return;
+    clearTimeout(this.timers[m.id]); this.timers[m.id] = setTimeout(() => this.write(m).catch(e => { console.error(e); toast('폴더 저장 실패: ' + e.message, 5000); }), 3000);
+  },
+  async write(m) {
+    if (!this.ready()) return;
+    const dirName = dirNameOf(m), base = await fileBaseOf(m);
+    const dir = await this.main.getDirectoryHandle(dirName, { create: true });
+    await writeText(dir, base + '.md', mdText(m));
+    await writeText(dir, base + '.json', meetingFileJSON(m));
+    // 날짜를 바꿨으면 예전 위치의 파일은 지운다
+    if (m.savedDir && (m.savedDir !== dirName || m.savedBase !== base)) {
+      try { const old = await this.main.getDirectoryHandle(m.savedDir); await old.removeEntry(m.savedBase + '.md'); await old.removeEntry(m.savedBase + '.json'); } catch {}
+    }
+    m.savedDir = dirName; m.savedBase = base; m.folderSavedAt = Date.now();
+    await saveMeeting(m, true);
+    if (current === m && tab === 'sum') View.saveStatus();
+  },
+  async pushAll() { if (!this.ready()) return; for (const m of await allMeetings()) if (hasContent(m) && (!m.folderSavedAt || m.folderSavedAt < m.updatedAt - 5000)) await this.write(m); },
+  // 폴더(와 하위 폴더 한 단계)에서 모임 파일을 읽어, 이 기기보다 새로운 것만 가져온다
+  async pullAll() {
+    let n = 0;
+    const scan = async (dir, depth) => {
+      for await (const [name, h] of dir.entries()) {
+        if (h.kind === 'directory') { if (depth < 1 && !name.startsWith('.')) await scan(h, depth + 1); continue; }
+        if (!FILE_RE.test(name)) continue;
+        try {
+          const data = JSON.parse(await (await h.getFile()).text());
+          const m = data?.type === 'soonnote-meeting' ? data.meeting : null;
+          if (!m || typeof m.id !== 'string' || typeof m.date !== 'string') continue;
+          const cur = await getMeeting(m.id);
+          if (cur && (cur.updatedAt || 0) >= (m.updatedAt || 0)) continue;
+          if (cur && Rec.on && Rec.meeting?.id === m.id) continue;
+          if (cur) { m.savedDir = cur.savedDir; m.savedBase = cur.savedBase; m.folderSavedAt = cur.folderSavedAt; }
+          mcache.set(m.id, m); await idb('meetings', 'readwrite', st => st.put(structuredClone(m))); n++;
+          if (this.ready()) await this.write(m);
+        } catch (e) { console.warn('읽기 실패', name, e); }
+      }
+    };
+    for (const k of ['inbox', 'main']) if (this[k] && this.ok[k]) await scan(this[k], 0);
+    if (n) toast(`폴더에서 ${n}개 모임을 가져왔어요`);
+    return n;
+  },
+};
+
+// 폰: 공유 화면으로 Google Drive 앱에 저장 (지원 안 되면 파일 다운로드)
+async function shareToDrive(m) {
+  const base = await fileBaseOf(m);
+  const files = [new File([mdText(m)], base + '.txt', { type: 'text/plain' }), new File([meetingFileJSON(m)], base + '_data.txt', { type: 'text/plain' })];
+  if (navigator.canShare?.({ files })) {
+    try { await navigator.share({ files, title: base }); } catch (e) { if (e.name === 'AbortError') return; throw e; }
+  } else { for (const f of files) download(f.name, f); }
+  m.exportedAt = Date.now(); await saveMeeting(m, true);
+}
+const needsExport = m => !canPickFolder && m.final && (!m.exportedAt || m.exportedAt < m.updatedAt - 5000);
+
 // ---------- 화면 ----------
 let current = null, tab = 'prep', streamingText = '';
 const View = {
@@ -573,6 +674,12 @@ const View = {
         <p class="muted">${isIOS() ? 'Safari 아래쪽 공유 버튼(□↑) → "홈 화면에 추가"' : 'Chrome 오른쪽 위 ⋮ → "홈 화면에 추가" 또는 "앱 설치"'}.
         홈 화면 앱으로 써야 폰이 기록을 임의로 지우지 않아요.</p>
         <button class="ghost" id="hideInstall">이미 했어요</button></div>` : ''}
+      ${canPickFolder && !Folder.main ? `<div class="card"><h2>📁 저장 폴더 연결 (노트북)</h2>
+        <p class="muted">모임 기록을 Google Drive와 동기화되는 폴더(예: "엘림 순모임")에 자동으로 저장해요. 주차별로 "9 27" 같은 폴더가 만들어져요.</p>
+        <button class="primary" id="pickMain">폴더 선택</button></div>` : ''}
+      ${Folder.needsGrant() ? `<div class="card" style="border-color:var(--warn)"><h2>📁 저장 폴더 다시 연결</h2>
+        <p class="muted">브라우저가 앱을 다시 열 때마다 폴더 사용 허락을 한 번 물어봐요.</p>
+        <button class="primary" id="grantDir">연결하기</button></div>` : ''}
       <div class="card"><h2>새 모임</h2>
         <div class="row">
           <button class="primary grow" id="newRec">🎙 녹음하며 모임하기</button>
@@ -584,10 +691,12 @@ const View = {
         ${list.length ? list.map(m => `<div class="list-item" data-id="${esc(m.id)}">
           <div class="grow"><div><b>${esc(m.date)}</b> ${esc(m.title || '')}</div>
           <div class="muted">${m.mode === 'notes' ? '메모' : '녹음 ' + (m.segments?.length || 0) + '구간'}${m.audioPurged ? ' · 음성 삭제됨' : ''}</div></div>
-          <span class="pill ${m.final ? '' : 'warn'}">${m.final ? '정리됨' : m.status === 'recording' ? '녹음 중단됨' : '정리 전'}</span></div>`).join('')
+          <span class="pill ${m.final && !needsExport(m) ? '' : 'warn'}">${needsExport(m) ? 'Drive 저장 전' : m.final ? '정리됨' : m.status === 'recording' ? '녹음 중단됨' : '정리 전'}</span></div>`).join('')
           : '<p class="muted">아직 기록이 없어요.</p>'}
       </div>`;
     $('#goSet')?.addEventListener('click', View.settings);
+    $('#pickMain')?.addEventListener('click', async () => { try { await Folder.pick('main'); toast('폴더를 연결했어요'); View.home(); } catch (e) { if (e.name !== 'AbortError') toast('실패: ' + e.message, 5000); } });
+    $('#grantDir')?.addEventListener('click', async () => { try { await Folder.grant(); } catch (e) { toast('실패: ' + e.message, 5000); } View.home(); });
     $('#hideInstall')?.addEventListener('click', () => { try { localStorage.setItem('soonnote.installHint', 'off'); } catch {} View.home(); });
     $('#newRec').onclick = () => newMeeting('record');
     $('#newNotes').onclick = () => newMeeting('notes');
@@ -619,6 +728,18 @@ const View = {
         <select id="sDays">${[[7, '1주'], [28, '4주'], [90, '3개월'], [0, '지우지 않음']].map(([v, l]) => `<option value="${v}" ${+settings.audioDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       </div>
       <div class="row" style="margin-bottom:14px"><button class="primary grow" id="sSave">저장</button></div>
+
+      <div class="card"><h2>📁 저장 폴더</h2>
+        ${canPickFolder ? `
+        <p class="muted">선택한 폴더에 주차별("9 27")로 정리 문서(.md)와 앱 데이터(.json)가 자동 저장돼요. Google Drive와 동기화되는 폴더를 고르세요.</p>
+        <p><b>저장 폴더:</b> ${Folder.main ? esc(Folder.main.name) + (Folder.ok.main ? ' ✅' : ' (다시 연결 필요)') : '없음'}</p>
+        <div class="row"><button id="pkMain">${Folder.main ? '바꾸기' : '선택'}</button>${Folder.main ? '<button class="ghost" id="fgMain">연결 해제</button>' : ''}</div>
+        <p style="margin-top:14px"><b>폰 파일 받는 폴더:</b> ${Folder.inbox ? esc(Folder.inbox.name) + (Folder.ok.inbox ? ' ✅' : ' (다시 연결 필요)') : '없음'}</p>
+        <p class="muted">폰에서 "Drive에 저장"으로 올린 파일이 있는 Google Drive 폴더(예: G: 드라이브의 "내 드라이브\\엘림 순모임 폰")를 고르면, 앱을 열 때마다 가져와서 저장 폴더에 정리해요.</p>
+        <div class="row"><button id="pkInbox">${Folder.inbox ? '바꾸기' : '선택'}</button>${Folder.inbox ? '<button class="ghost" id="fgInbox">연결 해제</button>' : ''}
+          ${Folder.main || Folder.inbox ? '<button id="pullNow">지금 가져오기·저장</button>' : ''}</div>`
+        : `<p class="muted">폰에서는 폴더에 바로 저장할 수 없어요. 모임을 정리한 뒤 "정리" 화면의 <b>Drive에 저장</b>을 눌러 Google Drive 앱의 "엘림 순모임 폰" 같은 폴더에 올려 주세요. 노트북 앱이 그 폴더에서 가져와 주차별로 정리해요.</p>`}
+      </div>
 
       <div class="card"><h2>🔒 PIN 잠금</h2>
         <p class="muted">앱을 열 때와 5분 이상 떠났다가 돌아올 때 PIN을 물어요. 다른 사람이 앱 화면을 여는 것을 막는 기능이고, 저장된 파일 자체를 암호화하지는 않아요. 폰 자체 잠금도 꼭 켜 두세요.</p>
@@ -670,6 +791,11 @@ const View = {
       const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
       settings.pinSalt = salt; settings.pinHash = await hashPin(a, salt); saveSettings(settings); toast('PIN을 설정했어요'); View.settings();
     };
+    const pk = kind => async () => { try { const n = await Folder.pick(kind); toast(`폴더를 연결했어요${n ? ` (${n}개 가져옴)` : ''}`); View.settings(); } catch (e) { if (e.name !== 'AbortError') toast('실패: ' + e.message, 5000); } };
+    $('#pkMain')?.addEventListener('click', pk('main')); $('#pkInbox')?.addEventListener('click', pk('inbox'));
+    $('#fgMain')?.addEventListener('click', async () => { await Folder.forget('main'); View.settings(); });
+    $('#fgInbox')?.addEventListener('click', async () => { await Folder.forget('inbox'); View.settings(); });
+    $('#pullNow')?.addEventListener('click', async () => { try { if (Folder.needsGrant()) await Folder.grant(); else { await Folder.pullAll(); await Folder.pushAll(); } toast('폴더와 맞췄어요'); } catch (e) { toast('실패: ' + e.message, 5000); } View.settings(); });
     $('#pinOff')?.addEventListener('click', () => { if (!confirm('PIN 잠금을 끌까요?')) return; settings.pinHash = ''; settings.pinSalt = ''; saveSettings(settings); View.settings(); });
     $('#shCopy').onclick = () => { if ($('#shKeys').checked && !confirm('API 키가 들어간 코드예요. 메신저로 보내지 말고 직접 옮겨 주세요. 복사할까요?')) return; copy(makeShareCode($('#shKeys').checked)); };
     $('#shApply').onclick = () => { try { applyShareCode($('#shIn').value); toast('설정을 적용했어요'); View.settings(); } catch (e) { toast('실패: ' + e.message, 4000); } };
@@ -749,8 +875,8 @@ const View = {
         </div>
       </div>
       ${p?.opening_prayer ? `<details class="card"><summary>🙏 시작 기도 보기</summary><div class="prayer" style="margin-top:10px">${esc(p.opening_prayer)}</div></details>` : ''}
-      <div class="card"><h2>지금 말하는 사람</h2>
-        <div class="speakers">${settings.members.map(n => `<button data-n="${esc(n)}" class="${n === lastTap ? 'on' : ''}">${esc(n)}</button>`).join('') || '<p class="muted">설정에서 순원 이름을 넣어 주세요.</p>'}</div>
+      <div class="card"><h2>지금 말하는 사람 <span class="kbd">· 키보드 숫자키로도 선택</span></h2>
+        <div class="speakers">${settings.members.map((n, i) => `<button data-n="${esc(n)}" class="${n === lastTap ? 'on' : ''}">${i < 9 ? `<span class="kbd">${i + 1}</span>` : ''}${esc(n)}</button>`).join('') || '<p class="muted">설정에서 순원 이름을 넣어 주세요.</p>'}</div>
         ${p?.questions?.length ? `<label>지금 나누는 질문</label><div class="qchips">${p.questions.map((q, i) => `<button data-q="${i}" title="${esc(q)}">Q${i + 1}</button>`).join('')}<button data-q="pray">기도제목</button></div>` : ''}
         <label>빠른 메모 (예: 길동 집사님 이사 준비 10/3)</label>
         <div class="row"><input id="memo" class="grow" placeholder="메모 후 Enter"><button id="memoBtn">추가</button></div>
@@ -865,7 +991,8 @@ const View = {
         <p class="muted" style="margin:8px 0 0">고친 내용은 자동 저장돼요. 공유 체크를 바꾸면 글이 다시 만들어져요.</p>
       </div>` : ''}
       ${m.mode !== 'notes' ? `<details class="card" id="trDet"><summary>전사록 (이름 고치기)</summary><div id="tr" style="margin-top:10px"></div></details>` : ''}
-      <div class="row"><button id="dlMd">기록 파일로 저장(.md)</button></div>`;
+      <div class="card"><h2>📁 저장</h2><p class="muted" id="saveStat"></p>
+        <div class="row"><button class="${canPickFolder ? '' : 'primary'} grow" id="saveBtn">${canPickFolder ? (Folder.ready() ? '지금 폴더에 저장' : '폴더 연결하기') : 'Drive에 저장'}</button></div></div>`;
     $('#sumGo').onclick = () => View.startFinalWhenReady();
     $('#cpPray')?.addEventListener('click', () => copy(f.closing.leader_prayer));
     $('#cpKakao')?.addEventListener('click', () => copy($('#kakao').value));
@@ -882,10 +1009,29 @@ const View = {
       if (navigator.share) { try { await navigator.share({ text }); } catch {} } else { copy(text); toast('복사했어요. 카톡 단톡방에 붙여넣어 주세요'); }
     });
     $('#kakao')?.addEventListener('input', e => { m.kakao = e.target.value; m.kakaoEdited = true; clearTimeout(View._kt); View._kt = setTimeout(() => saveMeeting(m), 600); });
-    $('#dlMd').onclick = () => downloadMd(m);
+    $('#saveBtn').onclick = async () => {
+      try {
+        if (!canPickFolder) await shareToDrive(m);
+        else if (!Folder.main) await Folder.pick('main');
+        else if (!Folder.ok.main) await Folder.grant();
+        if (Folder.ready()) await Folder.write(m);
+      } catch (e) { if (e.name !== 'AbortError') toast('실패: ' + e.message, 5000); }
+      View.saveStatus();
+    };
+    View.saveStatus();
     $('#trDet')?.addEventListener('toggle', e => e.target.open && View.transcript());
     View.sumProgress();
   },
+  saveStatus() {
+    const el = $('#saveStat'), m = current; if (!el || !m) return;
+    const when = t => new Date(t).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    if (canPickFolder) el.textContent = m.folderSavedAt && Folder.ready()
+      ? `✅ ${Folder.main.name}\\${m.savedDir}\\${m.savedBase}.md (${when(m.folderSavedAt)}) — 고치면 자동으로 다시 저장돼요.`
+      : Folder.main ? '폴더 연결을 다시 허락해 주세요.' : '저장 폴더가 아직 없어요.';
+    else el.textContent = m.exportedAt ? `마지막 Drive 저장: ${when(m.exportedAt)}${needsExport(m) ? ' — 그 뒤에 고친 내용이 있어요. 다시 저장해 주세요.' : ''}`
+      : '공유 화면에서 Google Drive를 고르고 "엘림 순모임 폰" 폴더에 저장해 주세요. 노트북 앱이 가져와서 정리해요.';
+  },
+  homeIfShown() { if (!current && !locked && $('#newRec')) View.home(); },
   transcript() {
     const m = current, el = $('#tr'); if (!el) return;
     const names = [...settings.members, '여럿', '불확실'];
@@ -917,15 +1063,21 @@ async function newMeeting(mode) {
   const m = { id: crypto.randomUUID(), mode, date: today(), title: '', createdAt: Date.now(), segments: [], taps: [], marks: [], memos: [], status: 'new' };
   await saveMeeting(m); View.meeting(m, mode === 'notes' ? 'live' : 'prep');
 }
-function downloadMd(m) {
+function mdText(m) {
   const f = m.final;
   let md = `# ${settings.groupName || '순모임'} ${m.date} ${m.title || ''}\n\n`;
   if (m.prep) md += `## 말씀\n${m.prep.sermon_title} (${m.prep.scripture})\n\n${(m.prep.questions || []).map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\n## 시작 기도\n${m.prep.opening_prayer}\n\n`;
   if (f) md += `## 한 명씩\n${f.flow}\n\n${f.people.map(p => `### ${p.name}\n${p.summary}\n${(p.prayer_requests || []).map(r => `- 🙏 ${r}`).join('\n')}`).join('\n\n')}\n\n## 마무리 기도 진행\n${f.closing.how_to}\n\n## 마무리 기도\n${f.closing.leader_prayer}\n\n## 카톡\n${m.kakao ?? buildKakao(m)}\n\n`;
   md += `## ${m.mode === 'notes' ? '메모' : '전사록'}\n${transcriptText(m)}\n`;
-  download(`순모임_${m.date}.md`, new Blob([md], { type: 'text/markdown' }));
+  return md;
 }
 
+// 노트북: 숫자키 1~9 로 말하는 사람 선택
+document.addEventListener('keydown', e => {
+  if (!Rec.on || tab !== 'live' || e.ctrlKey || e.metaKey || e.altKey || !/^[1-9]$/.test(e.key)) return;
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+  const b = $$('.speakers button')[+e.key - 1]; if (b) { e.preventDefault(); b.click(); }
+});
 $('#backBtn').onclick = () => { if (Rec.on) return toast('녹음 중이에요. 먼저 멈춰 주세요'); View.home(); };
 $('#settingsBtn').onclick = () => { if (Rec.on) return toast('녹음 중에는 설정을 열 수 없어요'); View.settings(); };
 window.addEventListener('beforeunload', e => { if (Rec.on) { e.preventDefault(); e.returnValue = ''; } });
@@ -934,3 +1086,5 @@ navigator.storage?.persist?.().catch(() => {});   // 폰이 저장소를 임의�
 purgeOldAudio().catch(console.error);
 retrySweep().catch(console.error);
 View.home();
+Folder.init().then(() => View.homeIfShown()).catch(console.error);
+if (location.hostname === 'localhost') window.__soon = { Folder, allMeetings, getMeeting, saveMeeting };   // 로컬 테스트용
