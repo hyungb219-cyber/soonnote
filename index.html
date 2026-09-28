@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.openai.com https://api.anthropic.com; img-src 'self' data: blob:; media-src 'self' blob:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>순모임 노트</title>
+<meta name="theme-color" content="#2f6b4f">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+:root{
+  --bg:#f6f4ee; --card:#ffffff; --ink:#1f2a24; --muted:#6b756f; --line:#e3e0d6;
+  --accent:#2f6b4f; --accent-ink:#ffffff; --accent-soft:#e3efe8; --warn:#b4572e; --warn-soft:#f8e7df;
+  --rec:#c0392b; --radius:14px;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#141816; --card:#1d2320; --ink:#e7ece9; --muted:#9aa59f; --line:#2c3430;
+    --accent:#6fbf97; --accent-ink:#0f1a14; --accent-soft:#223a2e; --warn:#e79a74; --warn-soft:#3a2820; --rec:#ef5b4c; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif;
+  font-size:16px;line-height:1.55;-webkit-text-size-adjust:100%}
+header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);
+  padding:calc(env(safe-area-inset-top) + 10px) 16px 10px;display:flex;align-items:center;gap:10px}
+header h1{font-size:18px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+main{max-width:760px;margin:0 auto;padding:16px 16px calc(env(safe-area-inset-bottom) + 90px)}
+button,.btn{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);
+  border-radius:10px;padding:10px 14px;cursor:pointer;min-height:44px}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button.danger{color:var(--warn);border-color:var(--warn)}
+button.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+button:disabled{opacity:.45;cursor:default}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:14px}
+.card h2{font-size:16px;margin:0 0 10px}
+.muted{color:var(--muted);font-size:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.grow{flex:1}
+input,textarea,select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);
+  border-radius:10px;padding:10px;width:100%}
+textarea{min-height:90px;resize:vertical}
+label{display:block;font-size:14px;color:var(--muted);margin:12px 0 4px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;position:sticky;top:57px;z-index:4;background:var(--bg);padding:6px 0}
+.tabs button{flex:1;min-height:40px}
+.tabs button.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+.list-item{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.list-item:last-child{border-bottom:0}
+.pill{font-size:12px;border-radius:999px;padding:2px 8px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.prayer{white-space:pre-wrap;font-size:17px;line-height:1.75}
+.speakers{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
+.speakers button{min-height:56px;font-size:16px;font-weight:600}
+.speakers button.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.recbar{display:flex;align-items:center;gap:12px}
+.recbtn{width:72px;height:72px;border-radius:50%;border:0;background:var(--rec);color:#fff;font-size:15px;font-weight:700;flex:none}
+.recbtn.stop{border-radius:18px}
+.timer{font-variant-numeric:tabular-nums;font-size:28px;font-weight:700}
+.meter{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:6px}
+.meter i{display:block;height:100%;width:0;background:var(--accent);transition:width .1s}
+.utt{padding:8px 0;border-bottom:1px dashed var(--line)}
+.utt .who{font-weight:700;margin-right:6px}
+.utt .t{color:var(--muted);font-size:12px;margin-right:6px;font-variant-numeric:tabular-nums}
+.utt.low .txt{color:var(--muted)}
+.utt select{width:auto;padding:4px 6px;font-size:14px;display:inline-block}
+.seg{display:flex;justify-content:space-between;gap:8px;font-size:14px;padding:6px 0;border-bottom:1px solid var(--line)}
+.person h3{margin:0 0 4px;font-size:16px}
+.person ul{margin:6px 0 0;padding-left:20px}
+.toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 24px);transform:translateX(-50%);
+  background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:14px;z-index:20;max-width:90vw}
+.hidden{display:none!important}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px}
+@keyframes s{to{transform:rotate(360deg)}}
+details summary{cursor:pointer;font-weight:600}
+.qchips{display:flex;gap:6px;flex-wrap:wrap}
+.qchips button{min-height:36px;padding:6px 10px;font-size:14px}
+.lock{max-width:360px;margin:12vh auto 0;text-align:center}
+.lock input{text-align:center;font-size:24px;letter-spacing:8px}
+.check{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted);margin-top:6px}
+.check input{width:auto}
+.stream{font-size:13px;color:var(--muted);white-space:pre-wrap;max-height:120px;overflow:auto}
+</style>
+</head>
+<body>
+<header>
+  <button id="backBtn" class="ghost hidden" aria-label="뒤로">←</button>
+  <h1 id="title">순모임 노트</h1>
+  <button id="settingsBtn" class="ghost" aria-label="설정">⚙︎</button>
+</header>
+<main id="app"></main>
+<div id="toast" class="toast hidden"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
