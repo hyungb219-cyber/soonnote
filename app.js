@@ -875,7 +875,7 @@ const View = {
             <li>순서를 넘길 때 <b>"○○ 집사님 이야기 들어볼까요?"</b> 하고 이름 불러 주기</li>
             <li>마무리 기도 전에 <b>기도제목을 읽어 드리고 확인</b>하기</li>
           </ol></div>
-        ${canPickFolder ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 (노트북)</b><div class="muted">"2026 순모임" 같은 Google Drive 폴더를 고르면 자동 저장돼요.</div></div>
+        ${canPickFolder ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 (노트북)</b><div class="muted">"2026엘림 순모임" 같은 Google Drive 폴더를 고르면 자동 저장돼요.</div></div>
           <button id="wFolder">${Folder.main ? '✅ ' + esc(Folder.main.name) : '선택'}</button></div></div>` : ''}
         ${!isStandalone() ? `<div class="card flat"><b>📲 홈 화면에 추가</b><p class="muted" style="margin:4px 0 0">${isIOS() ? 'Safari 공유 버튼(□↑) → "홈 화면에 추가"' : 'Chrome ⋮ → "홈 화면에 추가"'}</p></div>` : ''}`;
       $('#wFolder')?.addEventListener('click', async () => { try { await Folder.pick('main'); View.wizard(3); } catch (e) { if (e.name !== 'AbortError') toast('실패: ' + e.message, 5000); } });
@@ -918,10 +918,10 @@ const View = {
         <p class="muted">고른 폴더에 주차별("9 27")로 정리 문서(.md)와 앱 데이터(.json)가 자동 저장돼요.</p>
         <div class="row"><div class="grow"><b>저장 폴더</b><div class="muted">${Folder.main ? esc(Folder.main.name) + (Folder.ok.main ? ' ✅' : ' (다시 연결 필요)') : '없음'}</div></div>
           <button class="small" id="pkMain">${Folder.main ? '바꾸기' : '선택'}</button>${Folder.main ? '<button class="small ghost" id="fgMain">해제</button>' : ''}</div>
-        <div class="row" style="margin-top:12px"><div class="grow"><b>폰 파일 받는 폴더</b><div class="muted">${Folder.inbox ? esc(Folder.inbox.name) + (Folder.ok.inbox ? ' ✅' : ' (다시 연결 필요)') : '없음 — 예: G:\\내 드라이브\\2026 순모임 폰'}</div></div>
+        <div class="row" style="margin-top:12px"><div class="grow"><b>폰 파일 받는 폴더</b><div class="muted">${Folder.inbox ? esc(Folder.inbox.name) + (Folder.ok.inbox ? ' ✅' : ' (다시 연결 필요)') : '없음 — 예: G:\\내 드라이브\\2026엘림 순모임 폰'}</div></div>
           <button class="small" id="pkInbox">${Folder.inbox ? '바꾸기' : '선택'}</button>${Folder.inbox ? '<button class="small ghost" id="fgInbox">해제</button>' : ''}</div>
         ${Folder.main || Folder.inbox ? '<button id="pullNow" style="margin-top:12px">지금 가져오기·저장</button>' : ''}`
-        : `<p class="muted">폰에서는 정리가 끝난 뒤 "기도·공유" 화면의 <b>Drive에 저장</b>을 눌러 Google Drive 앱의 "2026 순모임 폰" 폴더에 올려 주세요. 노트북 앱이 가져와 주차별로 정리해요.</p>`}
+        : `<p class="muted">폰에서는 정리가 끝난 뒤 "기도·공유" 화면의 <b>Drive에 저장</b>을 눌러 Google Drive 앱의 "2026엘림 순모임 폰" 폴더에 올려 주세요. 노트북 앱이 가져와 주차별로 정리해요.</p>`}
       </div>
 
       <details class="card"><summary>🔒 PIN 잠금 ${settings.pinHash ? '<span class="pill">켜짐</span>' : ''}</summary>
@@ -1250,7 +1250,7 @@ const View = {
       ? `✅ ${Folder.main.name}\\${m.savedDir}\\${m.savedBase}.md (${when(m.folderSavedAt)}) — 고치면 자동으로 다시 저장돼요.`
       : Folder.main ? '폴더 연결을 다시 허락해 주세요.' : '저장 폴더가 아직 없어요.';
     else el.textContent = m.exportedAt ? `마지막 Drive 저장: ${when(m.exportedAt)}${needsExport(m) ? ' — 그 뒤에 고친 내용이 있어요. 다시 저장해 주세요.' : ''}`
-      : '공유 화면에서 Google Drive → "2026 순모임 폰" 폴더를 골라 주세요. 노트북 앱이 가져와 정리해요.';
+      : '공유 화면에서 Google Drive → "2026엘림 순모임 폰" 폴더를 골라 주세요. 노트북 앱이 가져와 정리해요.';
   },
   transcript() {
     const m = current, el = $('#tr'); if (!el) return;
