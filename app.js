@@ -8,6 +8,7 @@
 //  - 정밀(유료): 5분 구간을 OpenAI로 두 번 인식 + Claude Opus 5가 구간마다 화자·문장 정리.
 // =====================================================================
 import Anthropic from './vendor/anthropic-sdk.mjs';
+import qrcode from './vendor/qrcode.mjs';
 
 const ENGINES = {
   free: { label: '간편 · 무료', model: 'claude-sonnet-5', overlap: 300, minSeg: 40000, maxSeg: 90000 },
@@ -42,7 +43,8 @@ const SKEY = 'soonnote.settings.v1';
 function loadSettings() {
   let s = {}; try { s = JSON.parse(localStorage.getItem(SKEY) || '{}'); } catch {}
   return Object.assign({ engine: 'free', groqKey: '', openaiKey: '', anthropicKey: '', groupName: '', members: [], leader: '', context: '', keywords: '',
-    segMin: 5, audioDays: 28, pinHash: '', pinSalt: '' }, s);
+    segMin: 5, audioDays: 28, pinHash: '', pinSalt: '',
+    role: 'leader', member: null, memberName: '', collect: { url: '', key: '', token: '' } }, s);
 }
 function saveSettings(s) { try { localStorage.setItem(SKEY, JSON.stringify(s)); } catch {} }
 let settings = loadSettings();
@@ -523,6 +525,7 @@ function finalPrompt(m) {
 ${p.sermon_title ? `- 설교: ${p.sermon_title} (${p.scripture || ''})` : ''}
 ${qList(m).length ? `- 나눔 질문:\n${qList(m).map((q, i) => `  ${i + 1}. ${q}`).join('\n')}` : ''}
 ${m.sermon?.summary ? `- 오늘 설교 핵심(참고용, 순원이 한 말이 아님): ${m.sermon.summary.main_message}` : ''}
+${latestSubs(m).length ? `- 순원이 앱으로 직접 보낸 기도제목(본인이 쓴 글, 기도제목 정리와 마무리 기도에 반영): ${latestSubs(m).map(x => `${x.name}: ${x.prayer}`).join(' / ')}` : ''}
 ${freeNote}
 ${src}
 
@@ -555,16 +558,26 @@ async function runFinal(m, onText) {
   res.people.forEach(p => p.share = prevShare.get(p.name) || false);
   m.final = res; m.kakao = buildKakao(m); m.kakaoEdited = false; m.status = 'summarized'; await saveMeeting(m);
 }
-function buildKakao(m) {
-  const f = m.final; if (!f) return '';
-  const shared = f.people.filter(p => p.share && p.present !== false);
-  let t = `🌿 ${settings.groupName || '순모임'} ${shortDate(m.date)} 나눔과 기도제목\n${f.kakao_intro}\n`;
-  for (const p of shared) {
-    t += `\n▪️ ${p.name}\n${p.kakao_summary}`;
-    if (p.prayer_requests?.length) t += `\n🙏 ${p.prayer_requests.join(' / ')}`;
-    t += '\n';
+// 카톡 글에 들어갈 사람: 순원이 직접 보낸 기도제목(본인 동의)이 있으면 그 글 그대로, 없으면 나눔 정리에서 공유 동의한 분
+function kakaoPeople(m) {
+  const f = m.final, subs = latestSubs(m).filter(x => x.share), out = [], used = new Set();
+  const names = [...settings.members]; for (const pp of f?.people || []) if (!names.includes(pp.name)) names.push(pp.name);
+  for (const n of names) {
+    const pp = f?.people.find(x => x.name === n), sb = subs.find(x => matchName(x.name, n));
+    if (sb) used.add(sb);
+    const shared = pp && pp.share && pp.present !== false;
+    if (!sb && !shared) continue;
+    out.push({ name: n, summary: shared ? pp.kakao_summary : '', prayer: sb ? sb.prayer : (pp.prayer_requests || []).join(' / ') });
   }
-  t += `\n🙏 함께 드리는 기도\n${f.weekly_prayer}`;
+  for (const sb of subs) if (!used.has(sb)) out.push({ name: sb.name, summary: '', prayer: sb.prayer });
+  return out;
+}
+function buildKakao(m) {
+  const f = m.final, ppl = kakaoPeople(m);
+  if (!f && !ppl.length) return '';
+  let t = `🌿 ${settings.groupName || '순모임'} ${shortDate(m.date)} 나눔과 기도제목\n${f?.kakao_intro || '이번 주도 서로를 위해 기도해요.'}\n`;
+  for (const x of ppl) { t += `\n▪️ ${x.name}`; if (x.summary) t += `\n${x.summary}`; if (x.prayer) t += `\n🙏 ${x.prayer}`; t += '\n'; }
+  const wp = f?.weekly_prayer || m.weeklyPrayer; if (wp) t += `\n🙏 함께 드리는 기도\n${wp}`;
   return t;
 }
 
@@ -692,7 +705,7 @@ async function importBackup(file) {
   return n;
 }
 const SHARE_FIELDS = ['groupName', 'members', 'leader', 'context', 'keywords', 'segMin', 'audioDays', 'engine'];
-const KEY_FIELDS = ['groqKey', 'openaiKey', 'anthropicKey'];
+const KEY_FIELDS = ['groqKey', 'openaiKey', 'anthropicKey', 'collect'];
 function makeShareCode(withKeys) {
   const o = {}; for (const k of SHARE_FIELDS) o[k] = settings[k];
   if (withKeys) for (const k of KEY_FIELDS) o[k] = settings[k];
@@ -762,7 +775,7 @@ const Folder = {
     await saveMeeting(m, true);
     if (current === m && tab === 'sum') View.saveStatus();
   },
-  async pushAll() { if (!this.ready()) return; for (const m of await allMeetings()) if (hasContent(m) && (!m.folderSavedAt || m.folderSavedAt < m.updatedAt - 5000)) await this.write(m); },
+  async pushAll() { if (!this.ready()) return; for (const m of await allMeetings()) if (m.mode !== 'member' && hasContent(m) && (!m.folderSavedAt || m.folderSavedAt < m.updatedAt - 5000)) await this.write(m); },
   // 폴더(와 하위 폴더 한 단계)에서 모임 파일을 읽어, 이 기기보다 새로운 것만 가져온다
   async pullAll() {
     let n = 0;
@@ -803,6 +816,148 @@ const needsExport = m => !canPickFolder && m.final && (!m.exportedAt || m.export
 // =====================================================================
 // 화면
 // =====================================================================
+// ---------- 바탕화면(홈 화면)에 앱 추가 ----------
+// 안드로이드·PC 크롬/엣지는 버튼 한 번으로 설치, 아이폰은 브라우저가 막아 두어서 단계 안내를 보여 준다.
+const Install = {
+  prompt: null,
+  init() {
+    addEventListener('beforeinstallprompt', e => { e.preventDefault(); this.prompt = e; View.homeIfShown(); });
+    addEventListener('appinstalled', () => { this.prompt = null; toast('바탕화면에 앱이 추가됐어요 🎉'); View.homeIfShown(); });
+  },
+  inKakao: () => /KAKAOTALK/i.test(navigator.userAgent),
+  inOtherApp: () => /NAVER|Instagram|FBAN|FBAV|Line\/|DaumApps|everytimeApp/i.test(navigator.userAgent),
+  needed: () => !isStandalone(),
+  button(label = '📲 바탕화면에 앱 추가') { return this.needed() ? `<button class="primary big" data-install>${label}</button>` : ''; },
+  async run() {
+    // 카톡 안에서 열면 설치가 안 되니 기본 브라우저(사파리·크롬)로 다시 연다
+    if (this.inKakao()) { location.href = 'kakaotalk://web/openExternal?url=' + encodeURIComponent(location.href); return; }
+    if (this.inOtherApp()) return this.sheet('inapp');
+    if (this.prompt) { const p = this.prompt; this.prompt = null; p.prompt(); try { await p.userChoice; } catch {} return; }
+    // 아이폰 홈 화면 앱은 사파리와 저장 공간이 따로라서, 순원 참여 정보를 복사해 두었다가 처음 열 때 붙여넣는다
+    let copied = false;
+    if (settings.role === 'member' && settings.member) { try { await navigator.clipboard.writeText(memberJoinLink()); copied = true; } catch {} }
+    this.sheet(isIOS() ? 'ios' : 'android', copied);
+  },
+  sheet(kind, copied) {
+    const steps = {
+      ios: ['화면 아래(아이패드는 위)의 <b>공유 버튼 <span class="ic-share">□↑</span></b>을 누르세요', '목록을 내려서 <b>"홈 화면에 추가"</b>를 누르세요', '오른쪽 위 <b>"추가"</b>를 누르면 바탕화면에 생겨요'],
+      android: ['오른쪽 위 <b>⋮</b> 메뉴를 누르세요', '<b>"홈 화면에 추가"</b> 또는 <b>"앱 설치"</b>를 누르세요', '<b>"추가"</b> / <b>"설치"</b>를 누르면 바탕화면에 생겨요'],
+      inapp: ['오른쪽 위(또는 아래)의 <b>⋯</b> 메뉴를 누르세요', '<b>"다른 브라우저로 열기"</b>(사파리·크롬)를 누르세요', '열린 화면에서 다시 <b>"바탕화면에 앱 추가"</b>를 눌러 주세요'],
+    }[kind];
+    openSheet(`<h2>📲 바탕화면에 앱 추가</h2>
+      ${kind === 'ios' && !/Safari/i.test(navigator.userAgent) ? '<p class="say">사파리(Safari)에서 열어야 추가할 수 있어요.</p>' : ''}
+      <ol class="steplist">${steps.map(s => `<li>${s}</li>`).join('')}</ol>
+      ${copied ? '<p class="hintbox"><b>참여 정보가 복사됐어요</b>바탕화면 앱을 처음 열면 "붙여넣기"만 눌러 주세요.</p>' : ''}`);
+  },
+};
+// 기도문 크게 보기와 같은 전체 화면 안내 창
+function openSheet(html) {
+  const r = $('#reader');
+  r.innerHTML = `<div class="sheet">${html}</div><button class="primary close" id="rdClose">닫기</button>`;
+  r.classList.remove('hidden'); r.scrollTop = 0; document.body.style.overflow = 'hidden';
+  $('#rdClose').onclick = () => { r.classList.add('hidden'); r.innerHTML = ''; document.body.style.overflow = ''; };
+}
+document.addEventListener('click', e => { if (e.target.closest?.('[data-install]')) { e.preventDefault(); Install.run(); } });
+
+// ---------- 순원 기도제목 받기 (순장님 구글 시트 + Apps Script) ----------
+// 순원 앱 → (참여 코드와 함께) 구글 시트에 한 줄 추가 → 순장 앱이 (순장 키로) 읽어 온다.
+const b64url = s => utf8ToB64(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64urlDecode = s => b64ToUtf8(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+const randKey = n => hex(crypto.getRandomValues(new Uint8Array(n))).slice(0, n);
+const SCRIPT_URL_RE = /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/;
+const APPS_SCRIPT = (key, token) => `// 순모임 노트 — 순원 기도제목 받기
+// 이 코드는 순장님 구글 시트에만 있어요. 아래 두 값은 바꾸지 마세요.
+const LEADER_KEY = '${key}';   // 순장 앱만 아는 열쇠 (기도제목 읽기용)
+const JOIN_TOKEN = '${token}'; // 순원 초대 QR에 들어가는 참여 코드 (보내기용)
+
+function sheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName('기도제목');
+  if (!sh) { sh = ss.insertSheet('기도제목'); sh.appendRow(['받은 시각', '날짜', '이름', '기도제목', '단톡 공유']); }
+  return sh;
+}
+function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+
+function doPost(e) {
+  try {
+    const d = JSON.parse(e.postData.contents);
+    if (d.token !== JOIN_TOKEN) return out_({ ok: false, error: '참여 코드가 맞지 않아요. 순장님께 QR을 다시 받아 주세요.' });
+    const name = String(d.name || '').trim().slice(0, 30), prayer = String(d.prayer || '').trim().slice(0, 2000);
+    if (!name || !prayer) return out_({ ok: false, error: '이름과 기도제목을 적어 주세요.' });
+    const lock = LockService.getScriptLock(); lock.waitLock(10000);
+    try { sheet_().appendRow([new Date(), "'" + String(d.date || '').slice(0, 10), name, "'" + prayer, d.share ? 'O' : 'X']); }
+    finally { lock.releaseLock(); }
+    return out_({ ok: true });
+  } catch (err) { return out_({ ok: false, error: String(err) }); }
+}
+
+function doGet(e) {
+  if (e.parameter.key !== LEADER_KEY) return out_({ ok: false, error: '순장 키가 맞지 않아요.' });
+  const since = String(e.parameter.since || '');
+  const rows = sheet_().getDataRange().getValues().slice(1)
+    .map(r => ({ at: r[0] instanceof Date ? r[0].toISOString() : String(r[0]), date: String(r[1]), name: String(r[2]), prayer: String(r[3]), share: r[4] === 'O' }))
+    .filter(r => r.date >= since);
+  return out_({ ok: true, rows });
+}
+`;
+const Collect = {
+  ready: () => !!(settings.collect?.url && settings.collect?.key),
+  keys() { const c = settings.collect = settings.collect || {}; if (!c.key) c.key = randKey(12); if (!c.token) c.token = randKey(12); saveSettings(settings); return c; },
+  code() { const c = this.keys(); return APPS_SCRIPT(c.key, c.token); },
+  async parse(r) {
+    const t = await r.text(); let j;
+    try { j = JSON.parse(t); } catch { throw new Error('구글 시트 연결을 확인해 주세요. (웹 앱 배포의 액세스 권한이 "모든 사용자"인지)'); }
+    if (!j.ok) throw new Error(j.error || '실패했어요');
+    return j;
+  },
+  async post(url, body) {
+    let r;
+    // text/plain 으로 보내야 브라우저가 따로 허락을 묻지 않고 Apps Script 로 바로 보낸다
+    try { r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body) }); }
+    catch { throw new Error('보내지 못했어요. 인터넷 연결을 확인해 주세요.'); }
+    return this.parse(r);
+  },
+  async list(since) {
+    const c = settings.collect; let r;
+    try { r = await fetch(`${c.url}?key=${encodeURIComponent(c.key)}&since=${encodeURIComponent(since)}`); }
+    catch { throw new Error('불러오지 못했어요. 인터넷 연결을 확인해 주세요.'); }
+    return (await this.parse(r)).rows || [];
+  },
+  joinLink() { const c = this.keys(); return appBase() + '?join=' + b64url(JSON.stringify({ v: 1, g: settings.groupName || '순모임', u: c.url, t: c.token })); },
+};
+const appBase = () => location.origin + location.pathname.replace(/index\.html$/, '');
+const memberJoinLink = () => { const j = settings.member; return appBase() + '?join=' + b64url(JSON.stringify({ v: 1, g: j.g, u: j.u, t: j.t })); };
+function parseJoin(text) {
+  const mm = String(text || '').match(/[?&]join=([\w-]+)/); if (!mm) return null;
+  try { const o = JSON.parse(b64urlDecode(mm[1])); if (o?.v === 1 && SCRIPT_URL_RE.test(o.u) && o.t) return o; } catch {}
+  return null;
+}
+function applyJoin(o) { settings.role = 'member'; settings.member = { g: String(o.g || '순모임').slice(0, 40), u: o.u, t: String(o.t) }; saveSettings(settings); }
+const hasLeaderSetup = () => !!(settings.members.length || settings.anthropicKey);
+
+// 순원이 보낸 기도제목: 이름마다 가장 최근 것만
+const normName = n => String(n || '').replace(/\s|집사님|집사|권사님|권사|장로님|성도님|형제님|형제|자매님|자매|님/g, '');
+const matchName = (a, b) => { const x = normName(a), y = normName(b); return !!x && !!y && (x === y || (Math.min(x.length, y.length) >= 2 && (x.endsWith(y) || y.endsWith(x)))); };
+function latestSubs(m) {
+  const by = new Map();
+  for (const s of [...(m.submissions || [])].sort((a, b) => String(a.at).localeCompare(String(b.at)))) by.set(normName(s.name), s);
+  return [...by.values()];
+}
+async function loadSubs(m) {
+  const d = new Date(m.date + 'T12:00:00'), iso = x => x.toISOString().slice(0, 10);
+  const from = iso(new Date(+d - 6 * 864e5)), to = iso(new Date(+d + 864e5));
+  const rows = await Collect.list(from);
+  m.submissions = rows.filter(r => r.date <= to).map(r => ({ name: r.name, prayer: r.prayer, share: r.share, at: r.at, date: r.date }));
+  m.subsAt = Date.now();
+}
+// 함께 드리는 짧은 기도문 (나눔 정리를 안 한 날, 순원이 보낸 기도제목만으로)
+async function runWeeklyPrayer(m) {
+  const items = latestSubs(m).filter(s => s.share).map(s => s.prayer);
+  const res = await claudeJSON({ model: ENGINES[settings.engine].model, effort: 'medium', maxTokens: 4000, schema: obj({ prayer: str }), system: SYS_BASE,
+    content: [{ type: 'text', text: `순원들이 단톡방에 함께 올리기로 한 기도제목입니다.\n${items.map(x => '- ' + x).join('\n') || '(없음)'}\n${m.prep?.sermon_title ? `오늘 설교: ${m.prep.sermon_title} (${m.prep.scripture || ''})` : ''}\n\n단톡방 글 맨 끝에 붙일, 한 주 동안 서로를 위해 함께 드릴 3~4줄 기도문을 써 주세요. 특정인의 이름이나 사적인 내용은 넣지 말고 공동체 전체를 위한 기도로, "예수님의 이름으로 기도합니다. 아멘."으로 끝내 주세요.` }] });
+  m.weeklyPrayer = res.prayer;
+}
+
 let current = null, tab = 'prep', streamingText = '';
 function setHeader(t, back) { $('#title').textContent = t; $('#backBtn').classList.toggle('hidden', !back); }
 // 화면 아래 고정 버튼
@@ -857,18 +1012,20 @@ const View = {
   // ---------------- 홈 ----------------
   async home() {
     if (locked) return View.lock();
+    if (settings.role === 'member') { $('#settingsBtn').classList.remove('hidden'); return View.memberHome(); }
     current = null; setHeader(settings.groupName || '순모임 노트', false); dock();
-    const list = (await allMeetings()).sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
+    const list = (await allMeetings()).filter(m => m.mode !== 'member').sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
     const ongoing = list.find(m => m.date === today() && !m.final && m.mode === 'record');
   const ongoingTab = ongoing ? (ongoing.segments?.length ? 'live' : undefined) : undefined;
     let installHidden = false; try { installHidden = localStorage.getItem('soonnote.installHint') === 'off'; } catch {}
-    const showInstall = !isStandalone() && location.protocol === 'https:' && !installHidden;
+    const showInstall = Install.needed() && !installHidden;
     const setup = needSetup();
     $('#app').innerHTML = `
       ${setup ? `<div class="card hero accent">
           <div class="date">처음 오셨네요 👋</div>
           <div class="title">2분이면 준비돼요</div>
-          <button class="primary big" id="goWiz">설정 시작하기</button>
+          <button class="primary big" id="goWiz">설정 시작하기 (순장)</button>
+          <button class="ghost" id="goJoin" style="margin-top:6px">순원이에요 · 참여 링크 붙여넣기</button>
         </div>` : `<div class="card hero">
           <div class="date">${krDate(today())}</div>
           <div class="title">${ongoing ? '진행 중인 모임이 있어요' : '오늘 순모임'}</div>
@@ -882,9 +1039,11 @@ const View = {
         <button class="primary" id="grantDir">연결</button></div></div>` : ''}
       ${!setup && canPickFolder && !Folder.main ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 연결 (노트북)</b><div class="muted">기록을 Google Drive 폴더에 자동 저장해요.</div></div>
         <button id="pickMain">선택</button></div></div>` : ''}
-      ${showInstall ? `<div class="card flat"><b>📲 홈 화면에 추가해 주세요</b>
-        <p class="muted" style="margin:4px 0 6px">${isIOS() ? 'Safari 아래쪽 공유 버튼(□↑) → "홈 화면에 추가"' : 'Chrome 오른쪽 위 ⋮ → "홈 화면에 추가"'} — 앱처럼 열리고 기록도 안전하게 보관돼요.</p>
-        <button class="small ghost" id="hideInstall">이미 했어요</button></div>` : ''}
+      ${showInstall ? `<div class="card flat"><b>📲 바탕화면에 앱 추가</b>
+        <p class="muted" style="margin:4px 0 10px">앱처럼 바로 열리고 기록도 안전하게 보관돼요.</p>${Install.button()}
+        <button class="small ghost" id="hideInstall" style="margin-top:6px">나중에</button></div>` : ''}
+      ${!setup && Collect.ready() ? `<div class="card flat"><div class="row"><div class="grow"><b>📱 순원 초대 QR</b><div class="muted">순원들이 노트를 쓰고 기도제목을 보내요.</div></div>
+        <button id="homeQR">QR 보기</button></div></div>` : ''}
       <div class="card"><h2>지난 모임</h2>
         ${list.length ? list.map(m => { const [lbl, cls] = statusOf(m); return `<div class="list-item" data-id="${esc(m.id)}" role="button" tabindex="0">
           <span class="d">${shortDate(m.date)}</span>
@@ -894,6 +1053,8 @@ const View = {
           : '<p class="muted">아직 기록이 없어요.</p>'}
       </div>`;
     $('#goWiz')?.addEventListener('click', () => View.wizard(1));
+    $('#goJoin')?.addEventListener('click', () => View.joinPaste());
+    $('#homeQR')?.addEventListener('click', () => View.showQR());
     $('#resume')?.addEventListener('click', () => View.meeting(ongoing, ongoingTab));
     $('#newRec')?.addEventListener('click', () => newMeeting('record'));
     $('#newNotes')?.addEventListener('click', () => newMeeting('notes'));
@@ -903,6 +1064,131 @@ const View = {
     $$('.list-item').forEach(el => { const open = async () => View.meeting(await getMeeting(el.dataset.id)); el.onclick = open; el.onkeydown = e => { if (e.key === 'Enter') open(); }; });
   },
   homeIfShown() { if (!current && !locked && $('.hero')) View.home(); },
+
+  // ================= 순원 모드 (QR로 참여한 순원의 노트) =================
+  async memberHome() {
+    current = null; tab = ''; setHeader(settings.member?.g || '순모임 노트', false); dock();
+    if (!settings.memberName) return View.memberSetup();
+    const list = (await allMeetings()).filter(m => m.mode === 'member').sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
+    const todayNote = list.find(m => m.date === today());
+    $('#app').innerHTML = `
+      <div class="card hero">
+        <div class="date">${krDate(today())}</div>
+        <div class="title">${esc(settings.memberName)} 님, 반가워요</div>
+        <button class="primary big" id="mOpen">${todayNote ? '📖 오늘 노트 이어서 쓰기' : '📖 오늘 노트 쓰기'}</button>
+        <div class="muted" style="margin-top:8px">설교 노트 · 나눔 메모 · 내 기도제목</div>
+      </div>
+      ${Install.needed() ? `<div class="card flat"><b>📲 바탕화면에 앱 추가</b><p class="muted" style="margin:4px 0 10px">한 번 추가해 두면 앱처럼 바로 열려요.</p>${Install.button()}</div>` : ''}
+      <div class="card"><h2>지난 노트</h2>
+        ${list.length ? list.map(m => `<div class="list-item" data-id="${esc(m.id)}" role="button" tabindex="0">
+          <span class="d">${shortDate(m.date)}</span><div class="grow">${esc(m.sermonTitle || '주일 노트')}</div>
+          ${m.sentAt ? '<span class="pill">기도제목 보냄</span>' : ''}</div>`).join('') : '<p class="muted">아직 노트가 없어요.</p>'}
+      </div>`;
+    $('#mOpen').onclick = async () => {
+      let m = todayNote;
+      if (!m) { m = { id: crypto.randomUUID(), mode: 'member', date: today(), createdAt: Date.now(), sermonTitle: '', scripture: '', sermonNotes: '', questions: [{ q: '', note: '' }], prayer: '', share: true }; await saveMeeting(m); }
+      View.memberNote(m);
+    };
+    $$('.list-item').forEach(el => { const open = async () => View.memberNote(await getMeeting(el.dataset.id)); el.onclick = open; el.onkeydown = e => { if (e.key === 'Enter') open(); }; });
+  },
+  memberSetup() {
+    current = null; setHeader(settings.member?.g || '순모임 노트', false);
+    $('#app').innerHTML = `<div class="card hero accent">
+        <div class="date">${esc(settings.member?.g || '')}</div>
+        <div class="title">환영해요 🌿</div>
+        <p>설교 노트와 나눔 메모를 적고,<br>기도제목을 순장님께 보낼 수 있어요.</p>
+      </div>
+      <div class="card"><label class="f" for="mName" style="margin-top:0">이름을 알려 주세요</label>
+        <input id="mName" value="${esc(settings.memberName || '')}" placeholder="예: 홍길동" autocomplete="name">
+        <p class="hint">순장님이 누구의 기도제목인지 알 수 있게 실명으로 적어 주세요.</p></div>`;
+    dock(`<button class="primary big" id="mGo">시작하기</button>`, d => $('#mGo', d).onclick = () => {
+      const n = $('#mName').value.trim(); if (!n) return toast('이름을 적어 주세요');
+      settings.memberName = n; saveSettings(settings); View.memberHome(); });
+  },
+  memberNote(m) {
+    current = m; tab = 'member'; setHeader(`${shortDate(m.date)} 주일 노트`, true);
+    if (!m.questions?.length) m.questions = [{ q: '', note: '' }];
+    const changed = m.sentAt && m.prayer.trim() !== m.sentText;
+    $('#app').innerHTML = `
+      <div class="card">
+        <div class="sec-h"><span class="num">1</span><h2>📖 설교 노트</h2></div>
+        <input data-k="sermonTitle" value="${esc(m.sermonTitle)}" placeholder="설교 제목" aria-label="설교 제목">
+        <input data-k="scripture" value="${esc(m.scripture)}" placeholder="본문 (예: 히브리서 11:1-6)" aria-label="본문" style="margin-top:8px">
+        <textarea data-k="sermonNotes" rows="8" placeholder="마음에 남는 말씀, 기억하고 싶은 문장을 적어 보세요." aria-label="설교 노트" style="margin-top:8px">${esc(m.sermonNotes)}</textarea>
+      </div>
+      <div class="card">
+        <div class="sec-h"><span class="num">2</span><h2>💬 나눔 메모</h2></div>
+        <p class="muted">나눔 질문을 적고 내 생각을 메모해 보세요.</p>
+        ${m.questions.map((x, i) => `<div style="margin-top:12px">
+          <input data-q="${i}" value="${esc(x.q)}" placeholder="질문 ${i + 1}" aria-label="질문 ${i + 1}" style="font-weight:700">
+          <textarea data-qn="${i}" rows="3" placeholder="내 생각" aria-label="질문 ${i + 1} 메모" style="margin-top:6px">${esc(x.note)}</textarea></div>`).join('')}
+        <button class="small" id="mAddQ" style="margin-top:10px">＋ 질문 추가</button>
+      </div>
+      <div class="card accent">
+        <div class="sec-h"><span class="num">3</span><h2>🙏 내 기도제목</h2></div>
+        <textarea data-k="prayer" rows="4" placeholder="이번 주 함께 기도해 주셨으면 하는 제목을 적어 주세요." aria-label="내 기도제목">${esc(m.prayer)}</textarea>
+        <label class="toggle"><input type="checkbox" id="mShare" ${m.share !== false ? 'checked' : ''}><span>단톡방에 함께 올려도 돼요</span></label>
+        <p class="hint" id="mSent">${m.sentAt ? (changed ? '⚠️ 보낸 뒤에 고친 내용이 있어요. 다시 보내 주세요.' : `✅ ${new Date(m.sentAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })}에 순장님께 보냈어요`) : '끄면 순장님만 보고 단톡방에는 올리지 않아요.'}</p>
+      </div>`;
+    dock(`<button class="primary big" id="mSend">${m.sentAt ? '🙏 다시 보내기' : '🙏 순장님께 기도제목 보내기'}</button>`, d => $('#mSend', d).onclick = async () => {
+      const b = $('#mSend'); m.prayer = $('[data-k=prayer]').value;
+      if (!m.prayer.trim()) return toast('기도제목을 먼저 적어 주세요');
+      b.disabled = true; b.innerHTML = '<span class="spin"></span> 보내는 중…';
+      try {
+        await Collect.post(settings.member.u, { token: settings.member.t, name: settings.memberName, date: m.date, prayer: m.prayer.trim(), share: m.share !== false });
+        m.sentAt = Date.now(); m.sentText = m.prayer.trim(); await saveMeeting(m); toast('순장님께 보냈어요 🙏'); View.memberNote(m);
+      } catch (e) { toast(e.message, 6000); b.disabled = false; b.textContent = '🙏 다시 시도'; }
+    });
+    const save = () => { clearTimeout(View._mn); View._mn = setTimeout(() => saveMeeting(m), 600); };
+    $$('[data-k]').forEach(el => el.oninput = () => { m[el.dataset.k] = el.value; save();
+      if (el.dataset.k === 'prayer' && m.sentAt) $('#mSent').textContent = el.value.trim() !== m.sentText ? '⚠️ 보낸 뒤에 고친 내용이 있어요. 다시 보내 주세요.' : '✅ 보낸 내용과 같아요'; });
+    $$('[data-q]').forEach(el => el.oninput = () => { m.questions[+el.dataset.q].q = el.value; save(); });
+    $$('[data-qn]').forEach(el => el.oninput = () => { m.questions[+el.dataset.qn].note = el.value; save(); });
+    $('#mShare').onchange = e => { m.share = e.target.checked; saveMeeting(m); };
+    $('#mAddQ').onclick = () => { m.questions.push({ q: '', note: '' }); saveMeeting(m); View.memberNote(m); };
+  },
+  memberSettings() {
+    current = null; tab = ''; setHeader('설정', true);
+    $('#app').innerHTML = `
+      <div class="card"><h2>내 정보</h2>
+        <label class="f" for="msName">이름</label><input id="msName" value="${esc(settings.memberName || '')}">
+        <p class="muted" style="margin-top:10px">참여한 순: <b>${esc(settings.member?.g || '')}</b></p></div>
+      ${Install.needed() ? `<div class="card flat">${Install.button()}</div>` : ''}
+      <div class="card flat"><h2>순원 모드</h2>
+        <p class="muted">노트는 이 기기에만 저장되고, 기도제목만 "보내기"를 누를 때 순장님 구글 시트로 전달돼요.</p>
+        <button class="danger" id="msLeave">${hasLeaderSetup() ? '순장 모드로 돌아가기' : '순원 모드 끝내기'}</button></div>`;
+    dock(`<button class="primary big" id="msSave">저장</button>`, d => $('#msSave', d).onclick = () => {
+      const n = $('#msName').value.trim(); if (!n) return toast('이름을 적어 주세요');
+      settings.memberName = n; saveSettings(settings); toast('저장했어요'); View.home(); });
+    $('#msLeave').onclick = () => {
+      if (!confirm(hasLeaderSetup() ? '순장 모드로 돌아갈까요? (순원 노트는 그대로 남아요)' : '순원 모드를 끝낼까요? (적어 둔 노트는 그대로 남아요)')) return;
+      settings.role = 'leader'; saveSettings(settings); View.home();
+    };
+  },
+  // 순장: 순원 초대 QR
+  showQR() {
+    const link = Collect.joinLink(); const qr = qrcode(0, 'M'); qr.addData(link); qr.make();
+    openSheet(`<h2 style="text-align:center">${esc(settings.groupName || '순모임')} 순원 초대</h2>
+      <div class="qrbox">${qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true, alt: '순원 초대 QR 코드' })}</div>
+      <ol class="steplist" style="margin-top:16px"><li>순원이 <b>휴대폰 카메라</b>로 QR을 찍어요</li><li>열린 화면에서 <b>이름</b>을 적고</li><li><b>"바탕화면에 앱 추가"</b>를 눌러요</li></ol>
+      <div class="row" style="margin-top:12px"><button class="grow" id="qrCopy">링크 복사</button><button class="grow" id="qrShare">카톡으로 보내기</button></div>
+      <p class="hint" style="text-align:center">QR에는 기도제목을 보내는 주소만 들어 있어요. 순원은 다른 사람의 기도제목을 볼 수 없어요.</p>`);
+    $('#qrCopy').onclick = () => copy(link);
+    $('#qrShare').onclick = async () => { const text = `🌿 ${settings.groupName || '순모임'} 순원 노트\n아래 링크를 눌러 이름을 적고 "바탕화면에 앱 추가"를 눌러 주세요.\n${link}`;
+      if (navigator.share) { try { await navigator.share({ text }); } catch {} } else copy(text); };
+  },
+  // 바탕화면 앱(아이폰)에서 처음 열었을 때: 복사해 둔 참여 정보 붙여넣기
+  joinPaste() {
+    current = null; setHeader('순원으로 참여', true); dock();
+    $('#app').innerHTML = `<div class="card"><h2>순장님께 받은 참여 링크</h2>
+        <p class="muted">QR로 처음 열었을 때 참여 정보가 복사돼 있어요. 아래 버튼을 눌러 주세요.</p>
+        <button class="primary big" id="jpPaste">📋 붙여넣기</button>
+        <label class="f" for="jpText">또는 링크를 직접 붙여넣기</label><textarea id="jpText" rows="3" placeholder="https://…?join=…"></textarea>
+        <button id="jpGo" style="margin-top:8px">참여하기</button></div>`;
+    const go = t => { const j = parseJoin(t); if (!j) return toast('참여 링크가 아니에요. 순장님께 QR을 다시 받아 주세요', 5000); applyJoin(j); toast('참여했어요'); View.home(); };
+    $('#jpPaste').onclick = async () => { try { go(await navigator.clipboard.readText()); } catch { toast('붙여넣기가 막혀 있어요. 아래 칸에 길게 눌러 붙여넣어 주세요', 5000); } };
+    $('#jpGo').onclick = () => go($('#jpText').value);
+  },
 
   // ---------------- 처음 설정 (3단계) ----------------
   wizard(step) {
@@ -971,6 +1257,7 @@ const View = {
   // ---------------- 설정 ----------------
   async settings() {
     if (locked) return View.lock();
+    if (settings.role === 'member') return View.memberSettings();
     current = null; setHeader('설정', true); dock();
     const eng = settings.engine;
     $('#app').innerHTML = `
@@ -1007,6 +1294,25 @@ const View = {
           <button class="small" id="pkInbox">${Folder.inbox ? '바꾸기' : '선택'}</button>${Folder.inbox ? '<button class="small ghost" id="fgInbox">해제</button>' : ''}</div>
         ${Folder.main || Folder.inbox ? '<button id="pullNow" style="margin-top:12px">지금 가져오기·저장</button>' : ''}`
         : `<p class="muted">폰에서는 정리가 끝난 뒤 "기도·공유" 화면의 <b>Drive에 저장</b>을 눌러 Google Drive 앱의 "2026엘림 순모임 폰" 폴더에 올려 주세요. 노트북 앱이 가져와 주차별로 정리해요.</p>`}
+      </div>
+
+      <div class="card"><h2>📥 순원 기도제목 받기 (QR)</h2>
+        ${Collect.ready() ? `<p>✅ 구글 시트에 연결돼 있어요.</p>
+          <div class="row"><button class="primary" id="qrShow">순원 초대 QR 보기</button><button id="qrLink">링크 복사</button></div>`
+        : `<p class="muted">순원들이 앱에서 기도제목을 보내면 순장님 구글 시트에 모이고, "기도·공유" 화면에서 불러올 수 있어요. 처음 한 번만 설정하면 돼요 (약 10분).</p>`}
+        <details ${Collect.ready() ? '' : 'open'} style="margin-top:12px"><summary style="font-size:15px">${Collect.ready() ? '연결 다시 설정' : '설정 방법'}</summary>
+          <ol class="howto">
+            <li><a href="https://sheets.new" target="_blank" rel="noopener">sheets.new</a>로 새 구글 시트 만들기 (이름: 순모임 기도제목)</li>
+            <li>메뉴 <b>확장 프로그램 → Apps Script</b></li>
+            <li>있던 코드를 모두 지우고, 아래 <b>코드 복사</b> → 붙여넣기 → 💾 저장</li>
+            <li><b>배포 → 새 배포</b> → ⚙︎에서 <b>웹 앱</b> → 실행: <b>나</b>, 액세스 권한: <b>모든 사용자</b> → 배포</li>
+            <li>권한 허용 (경고가 나오면 <b>고급 → (안전하지 않음)으로 이동</b>) → <b>웹 앱 URL</b> 복사</li>
+            <li>아래 칸에 붙여넣고 <b>연결 확인</b></li>
+          </ol>
+          <button id="gsCode" style="margin-top:8px">📋 Apps Script 코드 복사</button>
+          <label class="f" for="gsUrl">웹 앱 URL</label><input id="gsUrl" value="${esc(settings.collect?.url || '')}" placeholder="https://script.google.com/macros/s/…/exec">
+          <div class="row" style="margin-top:8px"><button id="gsTest">연결 확인</button><span class="muted" id="gsMsg"></span></div>
+        </details>
       </div>
 
       <details class="card"><summary>🔒 PIN 잠금 ${settings.pinHash ? '<span class="pill">켜짐</span>' : ''}</summary>
@@ -1068,6 +1374,16 @@ const View = {
     $('#bkOut').onclick = async () => { const b = $('#bkOut'); b.disabled = true; b.textContent = '만드는 중…'; try { await exportBackup($('#bkAudio').checked); } catch (e) { toast('실패: ' + e.message, 4000); } b.disabled = false; b.textContent = '백업 파일 저장'; };
     $('#bkIn').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const n = await importBackup(f); toast(`${n}개 모임을 불러왔어요`); } catch (err) { toast('실패: ' + err.message, 4000); } };
     $('#reWiz').onclick = () => View.wizard(1);
+    $('#qrShow')?.addEventListener('click', () => View.showQR());
+    $('#qrLink')?.addEventListener('click', () => copy(Collect.joinLink()));
+    $('#gsCode').onclick = () => copy(Collect.code());
+    $('#gsTest').onclick = async () => {
+      const url = $('#gsUrl').value.trim(), msg = $('#gsMsg');
+      if (!SCRIPT_URL_RE.test(url)) return msg.textContent = '❌ "https://script.google.com/macros/s/…/exec" 모양의 주소를 넣어 주세요';
+      Collect.keys(); const prev = settings.collect.url; settings.collect.url = url; msg.textContent = '확인 중…';
+      try { await Collect.list('9999'); saveSettings(settings); toast('구글 시트에 연결됐어요'); View.settings(); }
+      catch (e) { settings.collect.url = prev; saveSettings(settings); msg.textContent = '❌ ' + e.message; }
+    };
     try {
       const persisted = await navigator.storage?.persisted?.(), est = await navigator.storage?.estimate?.();
       $('#stInfo').textContent = `${persisted ? '✅ 폰이 기록을 임의로 지우지 않도록 보호되고 있어요.' : '⚠️ 아직 보호되지 않았어요. 홈 화면에 추가해서 쓰면 보호돼요.'}` +
@@ -1374,8 +1690,8 @@ const View = {
 
   // ④ 기도·공유
   sum() {
-    const m = current, f = m.final;
-    const nShared = f ? f.people.filter(p => p.share).length : 0;
+    const m = current, f = m.final, subs = latestSubs(m), ppl = kakaoPeople(m);
+    const kakaoReady = !!f || ppl.length > 0;
     $('#pane').innerHTML = `<div id="sumProg"></div>
       ${!f ? `<div class="card ${View._finalRunning ? 'hidden' : ''}"><h2>나눔이 끝나면 정리해 드려요</h2>
           <p class="muted">한 분씩 요약과 기도제목, 기도 진행 안내, 마무리 기도문, 카톡 글을 만들어요.</p>
@@ -1383,13 +1699,14 @@ const View = {
       <div class="card">
         <div class="sec-h"><span class="num">1</span><h2>기도제목 확인</h2></div>
         <div class="say">기도하기 전에 오늘 나눠 주신 기도제목을 제가 잘 들었는지 여쭤볼게요. 틀리거나 더하실 게 있으면 말씀해 주세요.</div>
-        ${f.people.map((pp, i) => `<div class="person ${i === 0 ? 'first' : ''}" style="--pc:${colorOf(pp.name)}">
+        ${f.people.map((pp, i) => { const s = subs.find(x => matchName(x.name, pp.name)); return `<div class="person ${i === 0 ? 'first' : ''}" style="--pc:${colorOf(pp.name)}">
           <div class="avatar" aria-hidden="true">${esc(initials(pp.name))}</div>
           <div class="row"><h3 class="grow">${esc(pp.name)}</h3>${pp.present ? '' : '<span class="pill warn">나눔 기록 없음</span>'}<button class="small ghost" data-edit="${i}" aria-label="${esc(pp.name)} 기도제목 고치기">✏️ 고치기</button></div>
           ${pp.prayer_requests?.length ? `<ul class="req">${pp.prayer_requests.map(r => `<li>🙏 ${esc(r)}</li>`).join('')}</ul>` : '<div class="muted">기도제목 없음</div>'}
+          ${s ? `<div class="mynote" style="margin-top:6px"><b>📥 본인이 보낸 기도제목${s.share ? '' : ' · 단톡 공유 안 함'}</b>${esc(s.prayer)}</div>` : ''}
           <div class="sum">${esc(pp.summary)}</div>
           <label class="toggle"><input type="checkbox" data-share="${i}" ${pp.share ? 'checked' : ''}><span>단톡방 공유 동의</span></label>
-        </div>`).join('')}
+        </div>`; }).join('')}
         <div class="row" style="margin-top:8px"><button class="small" id="shAll">모두 공유 동의</button><button class="small ghost" id="shNone">모두 해제</button></div>
       </div>
       ${f.check_items?.length ? `<div class="card warn"><h2>⚠️ 확인해 주세요</h2><ul style="margin:0;padding-left:20px">${f.check_items.map(c => `<li>${esc(c)}</li>`).join('')}</ul></div>` : ''}
@@ -1400,20 +1717,29 @@ const View = {
       <div class="card">
         <div class="sec-h"><span class="num">3</span><h2>마무리 기도문</h2><button class="small" id="rdPray">크게 보기</button></div>
         <div class="prayer">${esc(f.closing.leader_prayer)}</div>
-      </div>
-      <div class="card">
-        <div class="sec-h"><span class="num">4</span><h2>카톡으로 나누기</h2><span class="pill ${nShared ? '' : 'warn'}">${nShared}명 공유</span></div>
+      </div>`}
+      ${Collect.ready() ? `<div class="card">
+        <div class="sec-h"><h2>📥 순원이 보낸 기도제목</h2><button class="small" id="subsLoad">불러오기</button></div>
+        <p class="muted" style="margin:0">${m.subsAt ? `${new Date(m.subsAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })}에 불러옴 · ${subs.length}명` : '순원들이 앱에서 보낸 기도제목을 가져와요. 단톡방 글에는 본인이 쓴 그대로 들어가요.'}</p>
+        ${f ? '' : subs.map(s => `<div class="person" style="--pc:${colorOf(settings.members.find(n => matchName(n, s.name)) || s.name)}">
+          <div class="avatar" aria-hidden="true">${esc(initials(s.name))}</div>
+          <div class="row"><h3 class="grow">${esc(s.name)}</h3>${s.share ? '' : '<span class="pill warn">단톡 공유 안 함</span>'}</div>
+          <div class="mynote" style="margin-top:4px">${esc(s.prayer)}</div></div>`).join('')}
+      </div>` : `<div class="card flat"><b>📱 순원들이 직접 기도제목을 보내게 하려면</b><p class="muted" style="margin:4px 0 0">⚙︎ 설정 → "순원 기도제목 받기"에서 한 번만 연결하고 QR을 나눠 주세요.</p></div>`}
+      ${kakaoReady ? `<div class="card">
+        <div class="sec-h">${f ? '<span class="num">4</span>' : ''}<h2>카톡으로 나누기</h2><span class="pill ${ppl.length ? '' : 'warn'}">${ppl.length}명</span></div>
+        ${!f && !m.weeklyPrayer ? `<button class="small" id="wpGo" style="margin-bottom:10px">✨ 함께 드릴 기도문 붙이기</button>` : ''}
         <textarea id="kakao" rows="14" aria-label="카톡 글">${esc(m.kakao ?? buildKakao(m))}</textarea>
         <div class="row" style="margin-top:10px"><button class="grow" id="cpKakao">복사</button></div>
-        <p class="hint">직접 고친 내용은 자동 저장돼요. 공유 동의를 바꾸면 글이 다시 만들어져요.</p>
-      </div>`}
+        <p class="hint">직접 고친 내용은 자동 저장돼요. 공유 동의를 바꾸거나 기도제목을 불러오면 글이 다시 만들어져요.</p>
+      </div>` : ''}
       ${m.mode !== 'notes' && m.segments?.length ? `<details class="card flat" id="trDet"><summary>📝 전체 대화 보기 · 이름 고치기</summary><div id="tr" style="margin-top:10px"></div>
         ${f ? '<button id="reSum" style="margin-top:12px">고친 내용으로 다시 정리</button>' : ''}</details>` : ''}
-      ${f ? `<div class="card flat"><h2>📁 저장</h2><p class="muted" id="saveStat"></p>
+      ${kakaoReady ? `<div class="card flat"><h2>📁 저장</h2><p class="muted" id="saveStat"></p>
         <button id="saveBtn">${canPickFolder ? (Folder.ready() ? '지금 폴더에 저장' : '폴더 연결하기') : 'Drive에 저장'}</button></div>` : ''}`;
-    dock(f && !View._finalRunning ? `<button class="primary big" id="share">💬 카톡으로 보내기</button>` : '', d => $('#share', d).onclick = async () => {
+    dock(kakaoReady && !View._finalRunning ? `<button class="primary big" id="share">💬 카톡으로 보내기</button>` : '', d => $('#share', d).onclick = async () => {
       const text = $('#kakao')?.value ?? m.kakao;
-      if (!f.people.some(p => p.share) && !confirm('공유 동의한 분이 없어서 인사와 기도문만 올라가요. 보낼까요?')) return;
+      if (!kakaoPeople(m).length && !confirm('단톡방 공유에 동의한 분이 없어서 인사와 기도문만 올라가요. 보낼까요?')) return;
       if (navigator.share) { try { await navigator.share({ text }); } catch {} } else { copy(text); toast('복사했어요. 카톡 단톡방에 붙여넣어 주세요'); }
       if (!canPickFolder && needsExport(m)) setTimeout(() => toast('기록 보관을 위해 아래 "Drive에 저장"도 눌러 주세요', 5000), 800);
     });
@@ -1434,6 +1760,15 @@ const View = {
     });
     $('#shAll')?.addEventListener('click', () => rebuild(() => f.people.forEach(p => p.share = true)));
     $('#shNone')?.addEventListener('click', () => rebuild(() => f.people.forEach(p => p.share = false)));
+    $('#subsLoad')?.addEventListener('click', async () => {
+      const b = $('#subsLoad'); b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+      try { await loadSubs(m); toast(`${latestSubs(m).length}명의 기도제목을 불러왔어요`); rebuild(() => {}); }
+      catch (e) { toast(e.message, 6000); b.disabled = false; b.textContent = '불러오기'; }
+    });
+    $('#wpGo')?.addEventListener('click', async () => {
+      const b = $('#wpGo'); b.disabled = true; b.innerHTML = '<span class="spin"></span> 쓰는 중…';
+      try { await runWeeklyPrayer(m); rebuild(() => {}); } catch (e) { toast('실패: ' + e.message, 6000); b.disabled = false; b.textContent = '✨ 함께 드릴 기도문 붙이기'; }
+    });
     $('#kakao')?.addEventListener('input', e => { m.kakao = e.target.value; m.kakaoEdited = true; clearTimeout(View._kt); View._kt = setTimeout(() => saveMeeting(m), 600); });
     $('#trDet')?.addEventListener('toggle', e => e.target.open && View.transcript());
     $('#saveBtn')?.addEventListener('click', async () => {
@@ -1530,6 +1865,9 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.se
 navigator.storage?.persist?.().catch(() => {});   // 폰이 저장소를 임의로 비우지 않도록 요청
 purgeOldAudio().catch(console.error);
 retrySweep().catch(console.error);
+Install.init();
+{ const j = parseJoin(location.search);
+  if (j && (settings.role === 'member' || !hasLeaderSetup() || confirm('순원 초대 링크예요. 이 기기를 순원 모드로 바꿀까요? (순장 설정은 그대로 남아요)'))) applyJoin(j); }
 View.home();
-Folder.init().then(() => View.homeIfShown()).catch(console.error);
+if (settings.role !== 'member') Folder.init().then(() => View.homeIfShown()).catch(console.error);
 if (location.hostname === 'localhost') window.__soon = { Folder, allMeetings, getMeeting, saveMeeting, Rec };   // 로컬 테스트용
