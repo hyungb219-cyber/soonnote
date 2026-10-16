@@ -83,7 +83,7 @@ async function idb(store, mode, fn) {
 const mcache = new Map();
 // quiet: 폴더 자동 저장을 다시 부르지 않음 (폴더 저장 자체가 남기는 기록용)
 const saveMeeting = (m, quiet) => { m.updatedAt = Date.now(); mcache.set(m.id, m);
-  if (!quiet) Folder.schedule(m);
+  if (!quiet) { Folder.schedule(m); Sync.schedule(m); }
   return idb('meetings', 'readwrite', st => st.put(structuredClone(m))); };
 const kvGet = k => idb('kv', 'readonly', st => st.get(k));
 const kvSet = (k, v) => idb('kv', 'readwrite', st => v === undefined ? st.delete(k) : st.put(v, k));
@@ -665,7 +665,7 @@ async function purgeOldAudio() {
     if (m.mode !== 'record' || m.audioPurged || (m.startedAt || m.createdAt) > cutoff) continue;
     if (!allSegs(m).every(s => s.status === 'done')) continue;   // 아직 글로 못 바꾼 녹음은 지우지 않는다
     for (const s of allSegs(m)) await delAudio(audioKey(m, s));
-    m.audioPurged = true; await saveMeeting(m);
+    m.audioPurged = true; await saveMeeting(m); Sync.dropAudio(m);
   }
 }
 
@@ -865,8 +865,9 @@ const b64url = s => utf8ToB64(s).replace(/\+/g, '-').replace(/\//g, '_').replace
 const b64urlDecode = s => b64ToUtf8(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
 const randKey = n => hex(crypto.getRandomValues(new Uint8Array(n))).slice(0, n);
 const SCRIPT_URL_RE = /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/;
-const APPS_SCRIPT = (key, token) => `// 순모임 노트 — 순원 기도제목 받기
+const APPS_SCRIPT = (key, token) => `// 순모임 노트 — 순원 기도제목 받기 + 폰·컴퓨터 기록 자동 동기화
 // 이 코드는 순장님 구글 시트에만 있어요. 아래 두 값은 바꾸지 마세요.
+// 처음 붙여넣은 뒤 위쪽 함수 목록에서 setup 을 골라 ▷실행 → 권한 허용 (Drive에 동기화 폴더를 만들어요)
 const LEADER_KEY = '${key}';   // 순장 앱만 아는 열쇠 (기도제목 읽기용)
 const JOIN_TOKEN = '${token}'; // 순원 초대 QR에 들어가는 참여 코드 (보내기용)
 
@@ -881,6 +882,7 @@ function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).set
 function doPost(e) {
   try {
     const d = JSON.parse(e.postData.contents);
+    if (d.op) return out_(d.key === LEADER_KEY ? syncPost_(d) : { ok: false, error: '순장 키가 맞지 않아요.' });
     if (d.token !== JOIN_TOKEN) return out_({ ok: false, error: '참여 코드가 맞지 않아요. 순장님께 QR을 다시 받아 주세요.' });
     const name = String(d.name || '').trim().slice(0, 30), prayer = String(d.prayer || '').trim().slice(0, 2000);
     if (!name || !prayer) return out_({ ok: false, error: '이름과 기도제목을 적어 주세요.' });
@@ -893,11 +895,75 @@ function doPost(e) {
 
 function doGet(e) {
   if (e.parameter.key !== LEADER_KEY) return out_({ ok: false, error: '순장 키가 맞지 않아요.' });
+  if (e.parameter.op) return out_(syncGet_(e.parameter));
   const since = String(e.parameter.since || '');
   const rows = sheet_().getDataRange().getValues().slice(1)
     .map(r => ({ at: r[0] instanceof Date ? r[0].toISOString() : String(r[0]), date: String(r[1]), name: String(r[2]), prayer: String(r[3]), share: r[4] === 'O' }))
     .filter(r => r.date >= since);
   return out_({ ok: true, rows });
+}
+
+// ---------- 폰·컴퓨터 기록 동기화 (순장 키가 있어야 해요) ----------
+// 순장님 Drive의 "순모임 노트 동기화" 폴더에 모임(meetings)과 녹음(audio)을 보관해요.
+function setup() { syncFolder_('meetings'); syncFolder_('audio'); }
+function syncFolder_(sub) {
+  const props = PropertiesService.getScriptProperties();
+  let root = null; const id = props.getProperty('SYNC_FOLDER');
+  if (id) { try { root = DriveApp.getFolderById(id); if (root.isTrashed()) root = null; } catch (err) { root = null; } }
+  if (!root) { root = DriveApp.createFolder('순모임 노트 동기화'); props.setProperty('SYNC_FOLDER', root.getId()); }
+  const it = root.getFoldersByName(sub);
+  return it.hasNext() ? it.next() : root.createFolder(sub);
+}
+function fileIn_(dir, name) { const it = dir.getFilesByName(name); return it.hasNext() ? it.next() : null; }
+const safeId_ = s => String(s || '').replace(/[^\\w-]/g, '');
+const audioName_ = k => String(k || '').replace(/[^\\w:-]/g, '').replace(':', '~');
+function trashAudio_(id) {
+  const files = syncFolder_('audio').getFiles();
+  while (files.hasNext()) { const f = files.next(); if (f.getName().indexOf(id + '~') === 0) f.setTrashed(true); }
+}
+function syncPost_(d) {
+  const lock = LockService.getScriptLock(); lock.waitLock(30000);
+  try {
+    if (d.op === 'put') {
+      const id = safeId_(d.id), at = Number(d.updatedAt) || 0; if (!id) return { ok: false, error: 'id 없음' };
+      const dir = syncFolder_('meetings'), f = fileIn_(dir, id + '.json');
+      if (f && (Number(String(f.getDescription()).split('|')[0]) || 0) >= at) return { ok: true, skipped: true };
+      const text = JSON.stringify({ updatedAt: at, deleted: !!d.deleted, meeting: d.deleted ? null : d.meeting });
+      const desc = at + '|' + (d.deleted ? 1 : 0);
+      if (f) { f.setContent(text); f.setDescription(desc); } else dir.createFile(id + '.json', text, 'application/json').setDescription(desc);
+      if (d.deleted) trashAudio_(id);
+      return { ok: true };
+    }
+    if (d.op === 'audio') {
+      const name = audioName_(d.k), dir = syncFolder_('audio'), old = fileIn_(dir, name);
+      if (old) old.setTrashed(true);
+      dir.createFile(Utilities.newBlob(Utilities.base64Decode(d.b64), String(d.type || 'audio/webm'), name));
+      return { ok: true };
+    }
+    if (d.op === 'delAudio') { trashAudio_(safeId_(d.id)); return { ok: true }; }
+    return { ok: false, error: '알 수 없는 요청' };
+  } finally { lock.releaseLock(); }
+}
+function syncGet_(p) {
+  if (p.op === 'list') {
+    const meetings = [], audio = [];
+    const mf = syncFolder_('meetings').getFiles();
+    while (mf.hasNext()) { const f = mf.next(), s = String(f.getDescription()).split('|');
+      meetings.push({ id: f.getName().replace(/\\.json$/, ''), at: Number(s[0]) || 0, del: s[1] === '1' }); }
+    const af = syncFolder_('audio').getFiles();
+    while (af.hasNext()) audio.push(af.next().getName().replace('~', ':'));
+    return { ok: true, meetings: meetings, audio: audio };
+  }
+  if (p.op === 'get') {
+    const f = fileIn_(syncFolder_('meetings'), safeId_(p.id) + '.json');
+    return f ? { ok: true, meeting: JSON.parse(f.getBlob().getDataAsString()).meeting } : { ok: false, error: '없음' };
+  }
+  if (p.op === 'audio') {
+    const f = fileIn_(syncFolder_('audio'), audioName_(p.k));
+    if (!f) return { ok: false, error: '없음' };
+    const b = f.getBlob(); return { ok: true, type: b.getContentType(), b64: Utilities.base64Encode(b.getBytes()) };
+  }
+  return { ok: false, error: '알 수 없는 요청' };
 }
 `;
 const Collect = {
@@ -934,6 +1000,104 @@ function parseJoin(text) {
 }
 function applyJoin(o) { settings.role = 'member'; settings.member = { g: String(o.g || '순모임').slice(0, 40), u: o.u, t: String(o.t) }; saveSettings(settings); }
 const hasLeaderSetup = () => !!(settings.members.length || settings.anthropicKey);
+
+// ---------- 폰·컴퓨터 자동 동기화 (같은 Apps Script → 순장님 Drive "순모임 노트 동기화" 폴더) ----------
+// 저장할 때마다 모임을 올리고, 앱을 열거나 돌아올 때 다른 기기에서 올린 것을 가져온다.
+// 녹음은 구간이 끝난 뒤 올린다. 더 늦게 고친 쪽이 이긴다.
+const LOCAL_FIELDS = ['savedDir', 'savedBase', 'folderSavedAt', 'exportedAt'];   // 기기마다 다른 값
+const Sync = {
+  meta: null, timers: {}, busy: false, last: 0, err: '', lastRun: 0,
+  on: () => settings.role !== 'member' && Collect.ready(),
+  wants: m => m.mode !== 'member' && (hasContent(m) || allSegs(m).length > 0),
+  // meta.m[id] = 서버와 같다고 확인한 updatedAt, meta.a[k] = 서버·이 기기 모두에 있는 녹음, meta.del[id] = 못 보낸 삭제
+  async loadMeta() { if (!this.meta) this.meta = Object.assign({ m: {}, a: {}, del: {} }, await kvGet('sync.meta')); return this.meta; },
+  saveMeta() { return kvSet('sync.meta', this.meta); },
+  async get(params) {
+    const c = settings.collect; let r;
+    try { r = await fetch(`${c.url}?${new URLSearchParams({ key: c.key, ...params })}`); }
+    catch { throw new Error('인터넷 연결을 확인해 주세요.'); }
+    return Collect.parse(r);
+  },
+  post(body) { return Collect.post(settings.collect.url, { key: settings.collect.key, ...body }); },
+  async pushMeeting(m) {
+    const meta = await this.loadMeta(), at = m.updatedAt;
+    if (meta.m[m.id] !== at) {
+      const copy = structuredClone(m); for (const k of LOCAL_FIELDS) delete copy[k];
+      await this.post({ op: 'put', id: m.id, updatedAt: at, meeting: copy });
+      meta.m[m.id] = at; await this.saveMeta();
+    }
+    if (m.audioPurged) return;
+    for (const s of allSegs(m)) {
+      const k = audioKey(m, s); if (s.status === 'recording' || meta.a[k]) continue;
+      const b = await getAudio(k); if (!b) continue;
+      await this.post({ op: 'audio', k, type: b.type, b64: await blobToB64(b) });
+      meta.a[k] = 1; await this.saveMeta();
+    }
+  },
+  async pull() {
+    const j = await this.get({ op: 'list' });
+    if (!Array.isArray(j.meetings)) throw new Error('Apps Script 코드를 새 버전으로 바꿔 주세요 (설정 → 🔄 폰·컴퓨터 자동 동기화)');
+    const meta = await this.loadMeta(), busyId = id => current?.id === id || (Rec.on && Rec.meeting?.id === id);
+    let n = 0;
+    for (const r of j.meetings) {
+      const cur = await getMeeting(r.id);
+      if (r.del) {
+        if (cur && (cur.updatedAt || 0) <= r.at && !busyId(r.id)) { await delMeeting(cur); n++; }
+        continue;
+      }
+      if ((cur && (cur.updatedAt || 0) >= r.at) || busyId(r.id)) continue;
+      const m = (await this.get({ op: 'get', id: r.id })).meeting;
+      if (m?.id !== r.id) continue;
+      if (cur) for (const k of LOCAL_FIELDS) if (k in cur) m[k] = cur[k];
+      mcache.set(m.id, m); await idb('meetings', 'readwrite', st => st.put(structuredClone(m)));
+      if (Folder.ready()) await Folder.write(m);   // 폴더 저장 기록 때문에 updatedAt 이 바뀌어도 다시 올리지 않게
+      meta.m[m.id] = m.updatedAt; await this.saveMeta(); n++;
+    }
+    for (const k of j.audio || []) {
+      if (meta.a[k]) continue;
+      const m = await getMeeting(k.slice(0, k.lastIndexOf(':'))); if (!m || m.audioPurged) continue;
+      if (!(await getAudio(k))) { const a = await this.get({ op: 'audio', k }); await putAudio(k, b64ToBlob(a.b64, a.type)); }
+      meta.a[k] = 1; await this.saveMeta();
+    }
+    return n;
+  },
+  async run(loud) {
+    if (!this.on() || this.busy || !navigator.onLine) return 0;
+    this.busy = true; this.lastRun = Date.now();
+    try {
+      const meta = await this.loadMeta();
+      for (const [id, at] of Object.entries(meta.del)) { await this.post({ op: 'put', id, updatedAt: at, deleted: true }); delete meta.del[id]; await this.saveMeta(); }
+      const n = await this.pull();
+      for (const m of await allMeetings()) if (this.wants(m)) await this.pushMeeting(m);
+      this.err = ''; this.last = Date.now();
+      if (n) { toast(`다른 기기에서 ${n}개 모임을 가져왔어요`); View.homeIfShown(); }
+      else if (loud) toast('동기화했어요');
+      return n;
+    } catch (e) { this.err = e.message; console.warn('동기화 실패', e); if (loud) toast('동기화 실패: ' + e.message, 5000); return 0; }
+    finally { this.busy = false; View.syncStatus?.(); }
+  },
+  // 저장할 때마다 조금 모았다가 올린다 (녹음 중에는 20초마다 저장되니 30초에 한 번만)
+  schedule(m) {
+    if (!this.on() || !this.wants(m) || this.timers[m.id]) return;
+    this.timers[m.id] = setTimeout(async () => {
+      delete this.timers[m.id];
+      if (this.busy) return this.schedule(m);
+      this.busy = true;
+      try { await this.pushMeeting(m); this.err = ''; this.last = Date.now(); }
+      catch (e) { this.err = e.message; console.warn('동기화 실패', e); }
+      finally { this.busy = false; }
+    }, Rec.on ? 30000 : 4000);
+  },
+  async remove(m) {
+    if (!this.on()) return;
+    const meta = await this.loadMeta(); meta.del[m.id] = Date.now(); delete meta.m[m.id]; await this.saveMeta();
+    this.run();
+  },
+  async dropAudio(m) {
+    if (!this.on()) return;
+    try { await this.post({ op: 'delAudio', id: m.id }); } catch (e) { console.warn(e); }
+  },
+};
 
 // 순원이 보낸 기도제목: 이름마다 가장 최근 것만
 const normName = n => String(n || '').replace(/\s|집사님|집사|권사님|권사|장로님|성도님|형제님|형제|자매님|자매|님/g, '');
@@ -1296,6 +1460,22 @@ const View = {
         : `<p class="muted">폰에서는 정리가 끝난 뒤 "기도·공유" 화면의 <b>Drive에 저장</b>을 눌러 Google Drive 앱의 "2026엘림 순모임 폰" 폴더에 올려 주세요. 노트북 앱이 가져와 주차별로 정리해요.</p>`}
       </div>
 
+      <div class="card"><h2>🔄 폰·컴퓨터 자동 동기화</h2>
+        ${Sync.on() ? `<p class="muted">폰에서 녹음·정리한 모임이 순장님 Google Drive("순모임 노트 동기화" 폴더)를 거쳐 다른 기기에도 자동으로 나타나요.</p>
+          <p id="syncStat" style="margin-top:8px"></p>
+          <button class="primary" id="syncNow" style="margin-top:8px">지금 동기화</button>
+          <details style="margin-top:12px"><summary style="font-size:15px">처음 켤 때 · "새 버전으로 바꿔 주세요"가 나오면</summary>
+            <ol class="howto">
+              <li>아래 📥 카드의 <b>📋 Apps Script 코드 복사</b></li>
+              <li>구글 시트 → <b>확장 프로그램 → Apps Script</b> → 있던 코드를 모두 지우고 붙여넣기 → 💾 저장</li>
+              <li>위쪽 함수 목록에서 <b>setup</b> 선택 → <b>▷ 실행</b> → 권한 허용 (Drive 권한이 새로 필요해요)</li>
+              <li><b>배포 → 배포 관리 → ✏️ → 버전: 새 버전 → 배포</b> (웹 앱 주소는 그대로예요)</li>
+              <li>다른 기기는 <b>📲 다른 기기로 설정 옮기기</b>에서 "API 키도 함께"로 옮기면 같이 연결돼요</li>
+            </ol>
+          </details>`
+        : `<p class="muted">폰에서 녹음한 모임이 컴퓨터에도 자동으로 나타나게 해요. 아래 <b>📥 순원 기도제목 받기</b>의 구글 시트 연결을 먼저 해 주세요. 같은 연결을 써요.</p>`}
+      </div>
+
       <div class="card"><h2>📥 순원 기도제목 받기 (QR)</h2>
         ${Collect.ready() ? `<p>✅ 구글 시트에 연결돼 있어요.</p>
           <div class="row"><button class="primary" id="qrShow">순원 초대 QR 보기</button><button id="qrLink">링크 복사</button></div>`
@@ -1377,6 +1557,11 @@ const View = {
     $('#qrShow')?.addEventListener('click', () => View.showQR());
     $('#qrLink')?.addEventListener('click', () => copy(Collect.joinLink()));
     $('#gsCode').onclick = () => copy(Collect.code());
+    View.syncStatus();
+    $('#syncNow')?.addEventListener('click', async () => {
+      const b = $('#syncNow'); b.disabled = true; b.innerHTML = '<span class="spin"></span> 맞추는 중…';
+      await Sync.run(true); b.disabled = false; b.textContent = '지금 동기화';
+    });
     $('#gsTest').onclick = async () => {
       const url = $('#gsUrl').value.trim(), msg = $('#gsMsg');
       if (!SCRIPT_URL_RE.test(url)) return msg.textContent = '❌ "https://script.google.com/macros/s/…/exec" 모양의 주소를 넣어 주세요';
@@ -1467,7 +1652,7 @@ const View = {
     $('#sSum').onclick = () => View.summarizeSermon();
     $('#pDate').onchange = e => { m.date = e.target.value; saveMeeting(m); };
     $('#pTitle').onchange = e => { m.title = e.target.value; m.titleEdited = true; saveMeeting(m); };
-    $('#pDel').onclick = async () => { if (Rec.on) return toast('녹음 중에는 지울 수 없어요'); if (confirm('이 모임과 녹음을 이 기기에서 지울까요? 되돌릴 수 없습니다.')) { await delMeeting(m); View.home(); } };
+    $('#pDel').onclick = async () => { if (Rec.on) return toast('녹음 중에는 지울 수 없어요'); if (confirm(`이 모임과 녹음을 ${Sync.on() ? '모든 기기(폰·컴퓨터)에서' : '이 기기에서'} 지울까요? 되돌릴 수 없습니다.`)) { await delMeeting(m); Sync.remove(m); View.home(); } };
     View.sermonStatus();
   },
   sermonStatus() {
@@ -1782,6 +1967,11 @@ const View = {
     });
     View.saveStatus(); View.sumProgress();
   },
+  syncStatus() {
+    const el = $('#syncStat'); if (!el) return;
+    el.textContent = Sync.busy ? '맞추는 중…' : Sync.err ? '⚠️ ' + Sync.err
+      : Sync.last ? `✅ 마지막 동기화: ${new Date(Sync.last).toLocaleTimeString('ko-KR', { hour: 'numeric', minute: '2-digit' })}` : '아직 동기화하지 않았어요';
+  },
   saveStatus() {
     const el = $('#saveStat'), m = current; if (!el || !m) return;
     const when = t => new Date(t).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
@@ -1869,5 +2059,9 @@ Install.init();
 { const j = parseJoin(location.search);
   if (j && (settings.role === 'member' || !hasLeaderSetup() || confirm('순원 초대 링크예요. 이 기기를 순원 모드로 바꿀까요? (순장 설정은 그대로 남아요)'))) applyJoin(j); }
 View.home();
-if (settings.role !== 'member') Folder.init().then(() => View.homeIfShown()).catch(console.error);
-if (location.hostname === 'localhost') window.__soon = { Folder, allMeetings, getMeeting, saveMeeting, Rec };   // 로컬 테스트용
+if (settings.role !== 'member') Folder.init().then(() => View.homeIfShown()).catch(console.error).finally(() => Sync.run());
+// 다른 기기 기록: 앱으로 돌아올 때, 인터넷이 돌아올 때, 열어 둔 동안 3분마다 맞춘다 (녹음 중에는 올리기만)
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !Rec.on && Date.now() - Sync.lastRun > 30000) Sync.run(); });
+addEventListener('online', () => Sync.run());
+setInterval(() => { if (document.visibilityState === 'visible' && !Rec.on) Sync.run(); }, 3 * 60000);
+if (location.hostname === 'localhost') window.__soon = { Folder, Sync, allMeetings, getMeeting, saveMeeting, putAudio, getAudio, Rec };   // 로컬 테스트용
