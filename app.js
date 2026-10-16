@@ -36,6 +36,7 @@ const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
 const unhex = h => Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16));
 function download(name, blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000); }
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isPhone = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 // ---------- 설정 (localStorage) ----------
@@ -1009,7 +1010,7 @@ const hasLeaderSetup = () => !!(settings.members.length || settings.anthropicKey
 // 녹음은 구간이 끝난 뒤 올린다. 더 늦게 고친 쪽이 이긴다.
 const LOCAL_FIELDS = ['savedDir', 'savedBase', 'folderSavedAt', 'exportedAt'];   // 기기마다 다른 값
 const Sync = {
-  meta: null, timers: {}, busy: false, last: 0, err: '', lastRun: 0,
+  meta: null, timers: {}, busy: false, last: 0, err: '', lastRun: 0, note: '',
   on: () => settings.role !== 'member' && Collect.ready(),
   wants: m => m.mode !== 'member' && (hasContent(m) || allSegs(m).length > 0),
   // meta.m[id] = 서버와 같다고 확인한 updatedAt, meta.a[k] = 서버·이 기기 모두에 있는 녹음, meta.del[id] = 못 보낸 삭제
@@ -1033,7 +1034,9 @@ const Sync = {
     for (const s of allSegs(m)) {
       const k = audioKey(m, s); if (s.status === 'recording' || meta.a[k]) continue;
       const b = await getAudio(k); if (!b) continue;
-      await this.post({ op: 'audio', k, type: b.type, b64: await blobToB64(b) });
+      this.note = `녹음 올리는 중… (${shortDate(m.date)} ${s.kind === 'sermon' ? '설교' : '나눔'} ${s.idx + 1}번째 구간)`; View.syncStatus?.();
+      try { await this.post({ op: 'audio', k, type: b.type, b64: await blobToB64(b) }); }
+      finally { this.note = ''; }
       meta.a[k] = 1; await this.saveMeta();
     }
   },
@@ -1215,7 +1218,8 @@ const View = {
     const ongoing = list.find(m => m.date === today() && !m.final && m.mode === 'record');
   const ongoingTab = ongoing ? (ongoing.segments?.length ? 'live' : undefined) : undefined;
     let installHidden = false; try { installHidden = localStorage.getItem('soonnote.installHint') === 'off'; } catch {}
-    const showInstall = Install.needed() && !installHidden;
+    // 카톡 안 화면의 기록은 다른 브라우저로 따라가지 않으니, 동기화 전에는 앱 추가(=크롬으로 이동)를 권하지 않는다
+    const showInstall = Install.needed() && !installHidden && !(Install.inKakao() && list.length && !Sync.on());
     // 연결만 하고 AI 키가 없는 기기는 기록 보기용으로 쓴다
     const setup = needSetup() && !Sync.on(), viewOnly = needSetup() && Sync.on();
     $('#app').innerHTML = `
@@ -1234,11 +1238,18 @@ const View = {
             <div class="muted" style="margin-top:8px">설교 노트 → 질문 준비 → 순모임 나눔 → 기도·공유</div>`}
           <button class="ghost" id="newNotes" style="margin-top:6px">📝 녹음 없이 메모로 정리하기</button>
         </div>`}
+      ${Install.inKakao() && list.length ? `<div class="card warn"><b>⚠️ 카카오톡 안에서 열린 화면이에요</b>
+        <p class="muted" style="margin-top:4px">여기 기록은 카카오톡 안에만 저장돼서 카톡 정리·재설치 때 사라질 수 있어요. ${Sync.on() ? '자동 동기화로 Drive에 올리고 있어요. 다 올라간 뒤 크롬에서 열어 쓰세요.' : '아래 <b>자동 동기화</b>를 먼저 켜서 Drive에 올려 주세요. 그 전에는 이 화면을 크롬 등 다른 브라우저로 옮기지 마세요 (기록이 따라가지 않아요).'}</p></div>` : ''}
+      ${!setup && !Sync.on() ? `<div class="card flat"><b>🔄 폰·컴퓨터 자동 동기화</b>
+        <div class="muted" style="margin:4px 0 10px">아직 꺼져 있어요. 켜면 이 기기의 기록과 녹음이 Drive에 올라가고, 폰·컴퓨터 어디서든 보여요.</div>
+        <div class="row"><button class="primary" id="syncPaste">🔗 연결 링크 붙여넣기</button><button id="syncHow">켜는 방법</button></div></div>`
+      : Sync.on() && !viewOnly ? `<div class="card flat"><div class="row"><div class="grow"><b>🔄 자동 동기화 켜짐</b><div class="muted" id="homeSync"></div></div>
+        <button id="homeSyncNow">지금</button></div></div>` : ''}
       ${viewOnly ? `<div class="card flat"><div class="row"><div class="grow"><b>🔗 연결된 기기예요</b><div class="muted">다른 기기의 기록을 볼 수 있어요. 이 기기에서 녹음을 글로 바꾸거나 정리하려면 AI 키를 넣어 주세요.</div></div>
         <button id="goKeys">AI 키</button></div></div>` : ''}
       ${Folder.needsGrant() ? `<div class="card warn"><div class="row"><div class="grow"><b>📁 저장 폴더 다시 연결</b><div class="muted">앱을 새로 열면 한 번 눌러 주셔야 해요.</div></div>
         <button class="primary" id="grantDir">연결</button></div></div>` : ''}
-      ${!setup && canPickFolder && !Folder.main ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 연결 (노트북)</b><div class="muted">기록을 Google Drive 폴더에 자동 저장해요.</div></div>
+      ${!setup && canPickFolder && !Folder.main && !isPhone() ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 연결 (노트북)</b><div class="muted">기록을 Google Drive 폴더에 자동 저장해요.</div></div>
         <button id="pickMain">선택</button></div></div>` : ''}
       ${showInstall ? `<div class="card flat"><b>📲 바탕화면에 앱 추가</b>
         <p class="muted" style="margin:4px 0 10px">앱처럼 바로 열리고 기록도 안전하게 보관돼요.</p>${Install.button()}
@@ -1257,6 +1268,10 @@ const View = {
     $('#goJoin')?.addEventListener('click', () => View.joinPaste());
     $('#goLink')?.addEventListener('click', () => View.joinPaste('link'));
     $('#goKeys')?.addEventListener('click', () => View.wizard(2));
+    $('#syncPaste')?.addEventListener('click', () => View.joinPaste('link'));
+    $('#syncHow')?.addEventListener('click', () => View.syncHow());
+    $('#homeSyncNow')?.addEventListener('click', () => Sync.run(true));
+    View.syncStatus();
     $('#homeQR')?.addEventListener('click', () => View.showQR());
     $('#resume')?.addEventListener('click', () => View.meeting(ongoing, ongoingTab));
     $('#newRec')?.addEventListener('click', () => newMeeting('record'));
@@ -2041,9 +2056,20 @@ const View = {
     View.saveStatus(); View.sumProgress();
   },
   syncStatus() {
-    const el = $('#syncStat'); if (!el) return;
-    el.textContent = Sync.busy ? '맞추는 중…' : Sync.err ? '⚠️ ' + Sync.err
+    const text = Sync.note ? Sync.note : Sync.busy ? '맞추는 중…' : Sync.err ? '⚠️ ' + Sync.err
       : Sync.last ? `✅ 마지막 동기화: ${new Date(Sync.last).toLocaleTimeString('ko-KR', { hour: 'numeric', minute: '2-digit' })}` : '아직 동기화하지 않았어요';
+    for (const el of [$('#syncStat'), $('#homeSync')]) if (el) el.textContent = text;
+  },
+  // 동기화 켜는 방법 (특히 카톡 안 화면처럼 기록이 이 화면에만 있을 때)
+  syncHow() {
+    openSheet(`<h2>🔄 자동 동기화 켜기</h2>
+      <ol class="steplist">
+        <li><b>컴퓨터</b> 앱 ⚙︎ 설정에서 <b>📥 구글 시트 연결</b>과 <b>🔄 자동 동기화</b> 안내(Apps Script 새 버전 배포)를 먼저 마쳐요</li>
+        <li><b>컴퓨터</b> ⚙︎ 설정 → <b>🔗 다른 기기 연결</b> → "AI 키도 함께" 체크 → <b>보내기</b>로 카톡 <b>"나와의 채팅"</b>에 보내요</li>
+        <li><b>이 폰</b>에서 카톡 나와의 채팅의 링크를 <b>길게 눌러 복사</b>해요</li>
+        <li>이 화면으로 돌아와 <b>🔗 연결 링크 붙여넣기 → 📋 붙여넣기</b></li>
+      </ol>
+      <p class="hintbox"><b>이 폰의 기록은 그대로 남아요</b>연결되면 이 기기에 있던 모임과 녹음이 자동으로 Drive에 올라가고, 컴퓨터에서도 보여요.</p>`);
   },
   saveStatus() {
     const el = $('#saveStat'), m = current; if (!el || !m) return;
