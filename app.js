@@ -713,7 +713,9 @@ function makeShareCode(withKeys) {
 }
 function applyShareCode(code) {
   const m = code.trim().match(/^SOONNOTE1:(.+)$/s); if (!m) throw new Error('설정 코드 형식이 아니에요');
-  const o = JSON.parse(b64ToUtf8(m[1].replace(/\s/g, '')));
+  applySettingsObj(JSON.parse(b64ToUtf8(m[1].replace(/\s/g, ''))));
+}
+function applySettingsObj(o) {
   for (const k of [...SHARE_FIELDS, ...KEY_FIELDS]) if (k in o) settings[k] = o[k];
   if (!Array.isArray(settings.members)) settings.members = [];
   if (!ENGINES[settings.engine]) settings.engine = 'free';
@@ -833,9 +835,10 @@ const Install = {
     if (this.inKakao()) { location.href = 'kakaotalk://web/openExternal?url=' + encodeURIComponent(location.href); return; }
     if (this.inOtherApp()) return this.sheet('inapp');
     if (this.prompt) { const p = this.prompt; this.prompt = null; p.prompt(); try { await p.userChoice; } catch {} return; }
-    // 아이폰 홈 화면 앱은 사파리와 저장 공간이 따로라서, 순원 참여 정보를 복사해 두었다가 처음 열 때 붙여넣는다
+    // 아이폰 홈 화면 앱은 사파리와 저장 공간이 따로라서, 순원 참여·기기 연결 정보를 복사해 두었다가 처음 열 때 붙여넣는다
     let copied = false;
-    if (settings.role === 'member' && settings.member) { try { await navigator.clipboard.writeText(memberJoinLink()); copied = true; } catch {} }
+    const carry = settings.role === 'member' && settings.member ? memberJoinLink() : Link.last;
+    if (carry) { try { await navigator.clipboard.writeText(carry); copied = true; } catch {} }
     this.sheet(isIOS() ? 'ios' : 'android', copied);
   },
   sheet(kind, copied) {
@@ -1099,6 +1102,36 @@ const Sync = {
   },
 };
 
+// ---------- 다른 기기 연결 링크 (폰·컴퓨터 어디서든) ----------
+// 링크 하나에 순 설정 + 동기화 연결(+ 원하면 AI 키)을 담는다. 주소의 # 뒤에 두어 서버로는 보내지지 않는다.
+// 이 링크를 연 기기는 같은 Drive 동기화 폴더에 붙어서 모든 모임을 가져온다.
+const Link = {
+  last: '',   // 아이폰: 사파리에서 연 링크를 바탕화면 앱으로 옮길 때 쓰려고 기억
+  make(withKeys) {
+    const o = { collect: { url: settings.collect.url, key: settings.collect.key, token: settings.collect.token } };
+    for (const k of SHARE_FIELDS) o[k] = settings[k];
+    if (withKeys) for (const k of ['groqKey', 'openaiKey', 'anthropicKey']) o[k] = settings[k];
+    return appBase() + '#link=' + b64url(JSON.stringify(o));
+  },
+  parse(text) {
+    const t = String(text || '').trim();
+    const mm = t.match(/[#&]link=([\w-]+)/);
+    try {
+      const o = mm ? JSON.parse(b64urlDecode(mm[1])) : /^SOONNOTE1:/.test(t) ? JSON.parse(b64ToUtf8(t.slice(10).replace(/\s/g, ''))) : null;
+      if (o?.collect?.url && SCRIPT_URL_RE.test(o.collect.url) && o.collect.key) return o;
+    } catch {}
+    return null;
+  },
+  same: o => settings.collect?.url === o.collect.url && settings.collect?.key === o.collect.key,
+  apply(o, text) {
+    // 이미 있는 AI 키는 링크에 키가 없으면 그대로 둔다
+    for (const k of ['groqKey', 'openaiKey', 'anthropicKey']) if (!o[k]) delete o[k];
+    if (!this.same(o)) { Sync.meta = { m: {}, a: {}, del: {} }; Sync.saveMeta(); }   // 다른 동기화 폴더에 붙으면 처음부터 맞춘다
+    applySettingsObj(o); settings.role = 'leader'; saveSettings(settings);
+    this.last = text || '';
+  },
+};
+
 // 순원이 보낸 기도제목: 이름마다 가장 최근 것만
 const normName = n => String(n || '').replace(/\s|집사님|집사|권사님|권사|장로님|성도님|형제님|형제|자매님|자매|님/g, '');
 const matchName = (a, b) => { const x = normName(a), y = normName(b); return !!x && !!y && (x === y || (Math.min(x.length, y.length) >= 2 && (x.endsWith(y) || y.endsWith(x)))); };
@@ -1183,12 +1216,14 @@ const View = {
   const ongoingTab = ongoing ? (ongoing.segments?.length ? 'live' : undefined) : undefined;
     let installHidden = false; try { installHidden = localStorage.getItem('soonnote.installHint') === 'off'; } catch {}
     const showInstall = Install.needed() && !installHidden;
-    const setup = needSetup();
+    // 연결만 하고 AI 키가 없는 기기는 기록 보기용으로 쓴다
+    const setup = needSetup() && !Sync.on(), viewOnly = needSetup() && Sync.on();
     $('#app').innerHTML = `
       ${setup ? `<div class="card hero accent">
           <div class="date">처음 오셨네요 👋</div>
           <div class="title">2분이면 준비돼요</div>
           <button class="primary big" id="goWiz">설정 시작하기 (순장)</button>
+          <button class="ghost" id="goLink" style="margin-top:6px">🔗 다른 기기에서 쓰던 기록 연결하기</button>
           <button class="ghost" id="goJoin" style="margin-top:6px">순원이에요 · 참여 링크 붙여넣기</button>
         </div>` : `<div class="card hero">
           <div class="date">${krDate(today())}</div>
@@ -1199,6 +1234,8 @@ const View = {
             <div class="muted" style="margin-top:8px">설교 노트 → 질문 준비 → 순모임 나눔 → 기도·공유</div>`}
           <button class="ghost" id="newNotes" style="margin-top:6px">📝 녹음 없이 메모로 정리하기</button>
         </div>`}
+      ${viewOnly ? `<div class="card flat"><div class="row"><div class="grow"><b>🔗 연결된 기기예요</b><div class="muted">다른 기기의 기록을 볼 수 있어요. 이 기기에서 녹음을 글로 바꾸거나 정리하려면 AI 키를 넣어 주세요.</div></div>
+        <button id="goKeys">AI 키</button></div></div>` : ''}
       ${Folder.needsGrant() ? `<div class="card warn"><div class="row"><div class="grow"><b>📁 저장 폴더 다시 연결</b><div class="muted">앱을 새로 열면 한 번 눌러 주셔야 해요.</div></div>
         <button class="primary" id="grantDir">연결</button></div></div>` : ''}
       ${!setup && canPickFolder && !Folder.main ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 연결 (노트북)</b><div class="muted">기록을 Google Drive 폴더에 자동 저장해요.</div></div>
@@ -1218,6 +1255,8 @@ const View = {
       </div>`;
     $('#goWiz')?.addEventListener('click', () => View.wizard(1));
     $('#goJoin')?.addEventListener('click', () => View.joinPaste());
+    $('#goLink')?.addEventListener('click', () => View.joinPaste('link'));
+    $('#goKeys')?.addEventListener('click', () => View.wizard(2));
     $('#homeQR')?.addEventListener('click', () => View.showQR());
     $('#resume')?.addEventListener('click', () => View.meeting(ongoing, ongoingTab));
     $('#newRec')?.addEventListener('click', () => newMeeting('record'));
@@ -1341,15 +1380,48 @@ const View = {
     $('#qrShare').onclick = async () => { const text = `🌿 ${settings.groupName || '순모임'} 순원 노트\n아래 링크를 눌러 이름을 적고 "바탕화면에 앱 추가"를 눌러 주세요.\n${link}`;
       if (navigator.share) { try { await navigator.share({ text }); } catch {} } else copy(text); };
   },
+  // 다른 기기 연결: QR(폰 카메라로) + 링크(컴퓨터·카톡 나에게 보내기)
+  showLink(withKeys) {
+    const link = Link.make(withKeys); const qr = qrcode(0, 'L'); qr.addData(link); qr.make();
+    openSheet(`<h2 style="text-align:center">🔗 다른 기기 연결</h2>
+      <p class="muted" style="text-align:center">폰·태블릿·다른 컴퓨터 어디서든 이 링크를 열면 같은 기록을 보고 이어서 쓸 수 있어요.</p>
+      <div class="qrbox">${qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true, alt: '기기 연결 QR 코드' })}</div>
+      <ol class="steplist" style="margin-top:16px"><li><b>폰:</b> 카메라로 QR을 찍어요</li><li><b>컴퓨터:</b> 링크를 복사해서 (카톡 "나와의 채팅"·메일로 보내) 브라우저 주소창에 붙여넣어요</li><li>링크가 열리면 연결되고 기록을 자동으로 가져와요 (이미 쓰던 기기면 <b>확인</b>을 한 번 눌러요)</li></ol>
+      <label class="check" style="margin-top:12px"><input type="checkbox" id="lkKeys" ${withKeys ? 'checked' : ''}> AI 키도 함께 (그 기기에서도 녹음 정리까지 하려면)</label>
+      <div class="row" style="margin-top:12px"><button class="grow" id="lkCopy">링크 복사</button><button class="grow" id="lkShare">보내기</button></div>
+      <p class="hint" style="text-align:center">⚠️ 이 링크는 순모임 기록 전체를 여는 열쇠예요${withKeys ? ' (AI 키 포함)' : ''}. 본인 기기에만 쓰고, 단체방에는 올리지 마세요.</p>`);
+    $('#lkKeys').onchange = e => View.showLink(e.target.checked);
+    $('#lkCopy').onclick = () => copy(link);
+    $('#lkShare').onclick = async () => { if (navigator.share) { try { await navigator.share({ title: '순모임 노트 연결', text: link }); } catch {} } else copy(link); };
+  },
+  // 아이폰 사파리에서 연결한 경우: 바탕화면 앱은 저장 공간이 따로라 한 번 더 붙여넣어야 한다
+  linkedIOS() {
+    openSheet(`<h2>✅ 이 사파리에 연결됐어요</h2>
+      <p>아이폰은 바탕화면 앱과 사파리가 기록을 따로 보관해요. 바탕화면 앱으로 쓰시려면:</p>
+      <ol class="steplist"><li>아래 <b>바탕화면에 앱 추가</b>를 눌러요 (연결 정보가 복사돼요)</li><li>바탕화면 앱을 처음 열면 <b>🔗 다른 기기에서 쓰던 기록 연결하기 → 붙여넣기</b></li></ol>
+      ${Install.button()}`);
+  },
   // 바탕화면 앱(아이폰)에서 처음 열었을 때: 복사해 둔 참여 정보 붙여넣기
-  joinPaste() {
-    current = null; setHeader('순원으로 참여', true); dock();
-    $('#app').innerHTML = `<div class="card"><h2>순장님께 받은 참여 링크</h2>
+  // kind 'link': 다른 기기(폰·컴퓨터)에서 받은 연결 링크
+  joinPaste(kind) {
+    const lk = kind === 'link';
+    current = null; setHeader(lk ? '다른 기기와 연결' : '순원으로 참여', true); dock();
+    $('#app').innerHTML = lk ? `<div class="card"><h2>연결 링크 붙여넣기</h2>
+        <p class="muted">기록이 있는 기기(폰이나 컴퓨터)의 ⚙︎ 설정 → <b>🔗 다른 기기 연결</b>에서 링크를 복사하거나 QR을 찍어 주세요. 링크를 복사해 왔다면 아래 버튼을 눌러 주세요.</p>
+        <button class="primary big" id="jpPaste">📋 붙여넣기</button>
+        <label class="f" for="jpText">또는 링크를 직접 붙여넣기</label><textarea id="jpText" rows="3" placeholder="https://…#link=…"></textarea>
+        <button id="jpGo" style="margin-top:8px">연결하기</button></div>`
+      : `<div class="card"><h2>순장님께 받은 참여 링크</h2>
         <p class="muted">QR로 처음 열었을 때 참여 정보가 복사돼 있어요. 아래 버튼을 눌러 주세요.</p>
         <button class="primary big" id="jpPaste">📋 붙여넣기</button>
         <label class="f" for="jpText">또는 링크를 직접 붙여넣기</label><textarea id="jpText" rows="3" placeholder="https://…?join=…"></textarea>
         <button id="jpGo" style="margin-top:8px">참여하기</button></div>`;
-    const go = t => { const j = parseJoin(t); if (!j) return toast('참여 링크가 아니에요. 순장님께 QR을 다시 받아 주세요', 5000); applyJoin(j); toast('참여했어요'); View.home(); };
+    const go = t => {
+      const l = Link.parse(t);
+      if (l) { Link.apply(l, t); toast('연결됐어요. 기록을 가져오는 중이에요…', 4000); View.home(); Sync.run(true); return; }
+      const j = !lk && parseJoin(t);
+      if (!j) return toast(lk ? '연결 링크가 아니에요. 링크 전체를 복사해 주세요' : '참여 링크가 아니에요. 순장님께 QR을 다시 받아 주세요', 5000);
+      applyJoin(j); toast('참여했어요'); View.home(); };
     $('#jpPaste').onclick = async () => { try { go(await navigator.clipboard.readText()); } catch { toast('붙여넣기가 막혀 있어요. 아래 칸에 길게 눌러 붙여넣어 주세요', 5000); } };
     $('#jpGo').onclick = () => go($('#jpText').value);
   },
@@ -1463,14 +1535,14 @@ const View = {
       <div class="card"><h2>🔄 폰·컴퓨터 자동 동기화</h2>
         ${Sync.on() ? `<p class="muted">폰에서 녹음·정리한 모임이 순장님 Google Drive("순모임 노트 동기화" 폴더)를 거쳐 다른 기기에도 자동으로 나타나요.</p>
           <p id="syncStat" style="margin-top:8px"></p>
-          <button class="primary" id="syncNow" style="margin-top:8px">지금 동기화</button>
+          <div class="row" style="margin-top:8px"><button class="primary" id="linkShow">🔗 다른 기기 연결</button><button id="syncNow">지금 동기화</button></div>
           <details style="margin-top:12px"><summary style="font-size:15px">처음 켤 때 · "새 버전으로 바꿔 주세요"가 나오면</summary>
             <ol class="howto">
               <li>아래 📥 카드의 <b>📋 Apps Script 코드 복사</b></li>
               <li>구글 시트 → <b>확장 프로그램 → Apps Script</b> → 있던 코드를 모두 지우고 붙여넣기 → 💾 저장</li>
               <li>위쪽 함수 목록에서 <b>setup</b> 선택 → <b>▷ 실행</b> → 권한 허용 (Drive 권한이 새로 필요해요)</li>
               <li><b>배포 → 배포 관리 → ✏️ → 버전: 새 버전 → 배포</b> (웹 앱 주소는 그대로예요)</li>
-              <li>다른 기기는 <b>📲 다른 기기로 설정 옮기기</b>에서 "API 키도 함께"로 옮기면 같이 연결돼요</li>
+              <li>다른 기기(폰·컴퓨터)는 위 <b>🔗 다른 기기 연결</b>의 QR이나 링크로 연결해요</li>
             </ol>
           </details>`
         : `<p class="muted">폰에서 녹음한 모임이 컴퓨터에도 자동으로 나타나게 해요. 아래 <b>📥 순원 기도제목 받기</b>의 구글 시트 연결을 먼저 해 주세요. 같은 연결을 써요.</p>`}
@@ -1558,6 +1630,7 @@ const View = {
     $('#qrLink')?.addEventListener('click', () => copy(Collect.joinLink()));
     $('#gsCode').onclick = () => copy(Collect.code());
     View.syncStatus();
+    $('#linkShow')?.addEventListener('click', () => View.showLink(false));
     $('#syncNow')?.addEventListener('click', async () => {
       const b = $('#syncNow'); b.disabled = true; b.innerHTML = '<span class="spin"></span> 맞추는 중…';
       await Sync.run(true); b.disabled = false; b.textContent = '지금 동기화';
@@ -2058,6 +2131,17 @@ retrySweep().catch(console.error);
 Install.init();
 { const j = parseJoin(location.search);
   if (j && (settings.role === 'member' || !hasLeaderSetup() || confirm('순원 초대 링크예요. 이 기기를 순원 모드로 바꿀까요? (순장 설정은 그대로 남아요)'))) applyJoin(j); }
+// 다른 기기에서 보낸 연결 링크로 열었을 때 (주소에서는 바로 지운다)
+if (location.hash.includes('link=')) {
+  const href = location.href, o = Link.parse(location.hash);
+  history.replaceState(null, '', location.pathname + location.search);
+  if (!o) toast('연결 링크가 잘렸어요. 링크 전체를 다시 열어 주세요', 5000);
+  else if (Link.same(o)) { Link.apply(o, href); toast('이미 연결된 기기예요. 설정을 맞췄어요'); }
+  else if (!hasLeaderSetup() || confirm('다른 기기에서 보낸 연결 링크예요. 이 기기를 연결해서 모든 순모임 기록을 볼 수 있게 할까요?\n(이 기기의 순 설정은 링크 내용으로 바뀌고, 이 기기의 기록은 그대로 남아 함께 합쳐져요)')) {
+    Link.apply(o, href); toast('연결됐어요. 기록을 가져오는 중이에요…', 4000);
+    if (isIOS() && !isStandalone()) setTimeout(() => View.linkedIOS(), 300);
+  }
+}
 View.home();
 if (settings.role !== 'member') Folder.init().then(() => View.homeIfShown()).catch(console.error).finally(() => Sync.run());
 // 다른 기기 기록: 앱으로 돌아올 때, 인터넷이 돌아올 때, 열어 둔 동안 3분마다 맞춘다 (녹음 중에는 올리기만)
