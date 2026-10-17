@@ -666,7 +666,7 @@ async function purgeOldAudio() {
     if (m.mode !== 'record' || m.audioPurged || (m.startedAt || m.createdAt) > cutoff) continue;
     if (!allSegs(m).every(s => s.status === 'done')) continue;   // 아직 글로 못 바꾼 녹음은 지우지 않는다
     for (const s of allSegs(m)) await delAudio(audioKey(m, s));
-    m.audioPurged = true; await saveMeeting(m); Sync.dropAudio(m);
+    m.audioPurged = true; await saveMeeting(m);   // Drive 동기화 폴더의 녹음은 보관용으로 남긴다
   }
 }
 
@@ -1099,10 +1099,6 @@ const Sync = {
     const meta = await this.loadMeta(); meta.del[m.id] = Date.now(); delete meta.m[m.id]; await this.saveMeta();
     this.run();
   },
-  async dropAudio(m) {
-    if (!this.on()) return;
-    try { await this.post({ op: 'delAudio', id: m.id }); } catch (e) { console.warn(e); }
-  },
 };
 
 // ---------- 다른 기기 연결 링크 (폰·컴퓨터 어디서든) ----------
@@ -1532,7 +1528,7 @@ const View = {
         <p class="hint">유료 서비스는 결제 설정에서 <b>월 사용 한도</b>를 꼭 걸어 두세요.</p>
       </div>
       <div class="card"><h2>녹음</h2>
-        <label class="f" for="sDays">녹음 파일 보관 기간 (지나면 음성만 지우고 글·요약은 남겨요)</label>
+        <label class="f" for="sDays">이 기기의 녹음 파일 보관 기간 (지나면 음성만 지우고 글·요약은 남겨요${Sync.on() ? '. Drive 동기화 폴더의 녹음은 계속 보관돼요' : ''})</label>
         <select id="sDays">${[[7, '1주'], [28, '4주'], [90, '3개월'], [0, '지우지 않음']].map(([v, l]) => `<option value="${v}" ${+settings.audioDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       </div>
 
