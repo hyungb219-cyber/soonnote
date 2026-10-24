@@ -38,6 +38,8 @@ function download(name, blob) { const a = document.createElement('a'); a.href = 
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const isPhone = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isPC = () => !isPhone() && !isIOS();
+const extOf = mime => mime.includes('wav') ? 'wav' : mime.includes('mp4') ? 'mp4' : 'webm';
 
 // ---------- 설정 (localStorage) ----------
 const SKEY = 'soonnote.settings.v1';
@@ -269,7 +271,7 @@ const Rec = {
   list() { const m = this.meeting; return this.kind === 'sermon' ? (m.sermonSegs = m.sermonSegs || []) : (m.segments = m.segments || []); },
   mime() { for (const t of ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm']) if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t; return ''; },
   async openStream() {
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { ...Mic.constraint(), echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
     this.stream.getAudioTracks()[0].onended = () => this.markDown();
     this.startLevel();
   },
@@ -374,6 +376,73 @@ const Rec = {
   },
 };
 
+// ---------- 마이크 고르기 (노트북: 내장 마이크·USB 마이크·헤드셋) ----------
+const Mic = {
+  async list() { try { return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId !== 'communications'); } catch { return []; } },
+  // 고른 마이크가 빠져 있으면 기본 마이크로 녹음한다
+  constraint: () => settings.micId ? { deviceId: { ideal: settings.micId } } : {},
+  label: d => d.deviceId === 'default' ? '기본 마이크 (Windows 설정) — ' + d.label.replace(/^(Default|기본값)\s*-\s*/i, '') : d.label || '마이크',
+  async current() { const ds = await this.list(); const d = ds.find(x => x.deviceId === (settings.micId || 'default')) || ds[0]; return d && d.label ? this.label(d) : ''; },
+};
+
+// ---------- 녹음 파일 불러오기 (폰 녹음 앱·다른 녹음기로 녹음한 파일) ----------
+// 16kHz 모노로 바꿔 말이 끊긴 곳에서 1~3분씩 잘라, 녹음 구간과 똑같이 글로 바꾼다.
+// 원본 파일이 따로 있으니 이 구간 음성은 Drive 동기화로 올리지 않는다 (글·요약은 동기화돼요).
+const IMPORT_RATE = 16000;
+async function decodeMono(file) {
+  const buf = await new OfflineAudioContext(1, 1, IMPORT_RATE).decodeAudioData(await file.arrayBuffer());
+  if (buf.numberOfChannels === 1) return buf.getChannelData(0);
+  const out = new Float32Array(buf.length), k = 1 / buf.numberOfChannels;
+  for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) out[i] += d[i] * k; }
+  return out;
+}
+// minS~maxS초 사이에서 가장 조용한 0.1초 지점을 자를 곳으로 고른다
+function cutPoints(pcm, minS, maxS) {
+  const fr = IMPORT_RATE / 10, n = Math.ceil(pcm.length / fr), rms = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const a = i * fr, b = Math.min(pcm.length, a + fr); let s = 0; for (let j = a; j < b; j++) s += pcm[j] * pcm[j]; rms[i] = s / (b - a || 1); }
+  const cuts = []; let at = 0;
+  while (n - at > maxS * 10) {
+    let best = at + maxS * 10, bv = Infinity;
+    for (let i = at + minS * 10; i < at + maxS * 10; i++) { const v = rms[i - 1] + rms[i] + rms[i + 1]; if (v <= bv) { bv = v; best = i; } }
+    cuts.push(best * fr); at = best;
+  }
+  return cuts;
+}
+function wavBlob(f32) {
+  const n = f32.length, v = new DataView(new ArrayBuffer(44 + n * 2));
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, IMPORT_RATE, true); v.setUint32(28, IMPORT_RATE * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, f32[i])); v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true); }
+  return new Blob([v.buffer], { type: 'audio/wav' });
+}
+async function importAudio(m, kind, files, say) {
+  const sermon = kind === 'sermon', seg5 = (settings.segMin || 5) * 60;
+  const [minS, maxS] = sermon ? [90, 180] : engineOf(m) === 'free' ? [ENGINES.free.minSeg / 1000, ENGINES.free.maxSeg / 1000] : [seg5 - 30, seg5];
+  const list = sermon ? (m.sermonSegs = m.sermonSegs || []) : (m.segments = m.segments || []);
+  const start = list.length ? list.at(-1).startMs + list.at(-1).durMs : 0;
+  let at = start, n = 0;
+  for (const [fi, f] of files.entries()) {
+    say(`파일 여는 중… ${files.length > 1 ? `(${fi + 1}/${files.length}) ` : ''}${f.name}`);
+    let pcm;
+    try { pcm = await decodeMono(f); }
+    catch { throw fatal(`"${f.name}"을(를) 열 수 없어요. 녹음 파일(m4a·mp3·wav 등)인지 확인해 주세요. 아주 긴 파일은 나눠서 올려 주세요.`); }
+    const cuts = [0, ...cutPoints(pcm, minS, maxS), pcm.length];
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const part = pcm.subarray(cuts[i], cuts[i + 1]), durMs = Math.round(part.length / IMPORT_RATE * 1000);
+      const seg = { idx: list.length, startMs: at, durMs, mime: 'audio/wav', status: 'recorded', imported: true };
+      if (sermon) seg.kind = 'sermon';
+      await putAudio(audioKey(m, seg), wavBlob(part));
+      list.push(seg); at += durMs; n++;
+      say(`나누는 중… ${fmt(at - start)}`);
+    }
+  }
+  if (sermon) { if (!m.sermonStartedAt) m.sermonStartedAt = Date.now() - at; }
+  else { if (!m.startedAt) m.startedAt = Date.now() - at; m.status = 'recorded'; }
+  await saveMeeting(m); Worker.kick(m.id);
+  return { n, ms: at - start };
+}
+
 // ---------- 구간 처리 워커 ----------
 const segSchema = obj({ utterances: { type: 'array', items: obj({ t: { type: 'number' }, speaker: str, text: str, confidence: { type: 'string', enum: ['high', 'low'] } }) }, notes: str });
 const Worker = {
@@ -396,7 +465,7 @@ const Worker = {
     try {
       const blob = await getAudio(audioKey(m, seg));
       if (!blob || blob.size < 2000) { seg.status = 'done'; seg.utterances = []; await saveMeeting(m); return; }
-      const fname = `seg${seg.idx}.${seg.mime.includes('mp4') ? 'mp4' : 'webm'}`;
+      const fname = `seg${seg.idx}.${extOf(seg.mime)}`;
       if (seg.kind === 'sermon') {
         // 설교: 화자 구분 없이 글로만 (Groq 키가 있으면 무료로, 없으면 OpenAI)
         seg.status = 'transcribing'; View.refreshLive();
@@ -520,7 +589,7 @@ function finalPrompt(m) {
 - 발화 앞의 이름은 순장이 누른 "지금 말하는 사람" 버튼 기준의 추정이라 틀릴 수 있습니다. 버튼을 늦게 누르거나 빠뜨린 곳도 있습니다.
   대화 흐름과 호명(예: "○○ 집사님 이야기 들어볼까요?" 바로 다음 발화는 ○○ 집사님), 본인 이야기의 내용(가족 관계 등 참고 정보)으로 누가 말했는지 다시 판단하세요.
 - 확실히 판단하기 어려운 사람·내용은 check_items에 적어 모임 중에 확인할 수 있게 해 주세요.
-` : '';
+${!(m.taps || []).length ? '- 이번 기록에는 이름 버튼 기록이 없어(녹음 파일을 불러온 경우 등) 모든 발화가 "(누군지 모름)"입니다. 호명·대화 흐름·본인 이야기 내용으로 누가 말했는지 판단하세요.\n' : ''}` : '';
   return `${groupInfo()}
 - 날짜: ${m.date}
 ${p.sermon_title ? `- 설교: ${p.sermon_title} (${p.scripture || ''})` : ''}
@@ -840,20 +909,29 @@ const Install = {
     let copied = false;
     const carry = settings.role === 'member' && settings.member ? memberJoinLink() : Link.last;
     if (carry) { try { await navigator.clipboard.writeText(carry); copied = true; } catch {} }
-    this.sheet(isIOS() ? 'ios' : 'android', copied);
+    this.sheet(isIOS() ? 'ios' : isPhone() ? 'android' : 'pc', copied && !isPC());
   },
   sheet(kind, copied) {
     const steps = {
       ios: ['화면 아래(아이패드는 위)의 <b>공유 버튼 <span class="ic-share">□↑</span></b>을 누르세요', '목록을 내려서 <b>"홈 화면에 추가"</b>를 누르세요', '오른쪽 위 <b>"추가"</b>를 누르면 바탕화면에 생겨요'],
       android: ['오른쪽 위 <b>⋮</b> 메뉴를 누르세요', '<b>"홈 화면에 추가"</b> 또는 <b>"앱 설치"</b>를 누르세요', '<b>"추가"</b> / <b>"설치"</b>를 누르면 바탕화면에 생겨요'],
+      pc: ['크롬 오른쪽 위 <b>⋮</b> 메뉴를 누르세요', '<b>"전송, 저장, 공유"</b> → <b>"페이지를 앱으로 설치"</b>(또는 주소창 오른쪽 <b>설치 아이콘</b>)를 누르세요', '<b>"설치"</b>를 누르면 바탕화면·시작 메뉴에 생겨요'],
       inapp: ['오른쪽 위(또는 아래)의 <b>⋯</b> 메뉴를 누르세요', '<b>"다른 브라우저로 열기"</b>(사파리·크롬)를 누르세요', '열린 화면에서 다시 <b>"바탕화면에 앱 추가"</b>를 눌러 주세요'],
     }[kind];
     openSheet(`<h2>📲 바탕화면에 앱 추가</h2>
       ${kind === 'ios' && !/Safari/i.test(navigator.userAgent) ? '<p class="say">사파리(Safari)에서 열어야 추가할 수 있어요.</p>' : ''}
       <ol class="steplist">${steps.map(s => `<li>${s}</li>`).join('')}</ol>
+      ${kind === 'pc' ? bookmarkHint() : ''}
       ${copied ? '<p class="hintbox"><b>참여 정보가 복사됐어요</b>바탕화면 앱을 처음 열면 "붙여넣기"만 눌러 주세요.</p>' : ''}`);
   },
 };
+// 컴퓨터 크롬: 즐겨찾기로 열어도 같은 기록 (같은 크롬이면 즐겨찾기·설치한 앱·새 탭 모두 같은 저장 공간)
+const bookmarkHint = () => `<p class="hintbox"><b>⭐ 즐겨찾기로 써도 돼요</b>이 화면에서 <b>Ctrl + D</b>를 누르면 크롬 즐겨찾기에 저장돼요. 언제든 같은 주소(${esc(appBase())})로 열면 같은 크롬의 기록이 그대로 나와요.</p>`;
+// 폰은 공유 화면(카톡 등)으로, 컴퓨터는 복사해서 카톡 PC에 붙여넣는다
+async function shareText(text, title) {
+  if (navigator.share && !isPC()) { try { await navigator.share(title ? { title, text } : { text }); } catch {} return; }
+  try { await navigator.clipboard.writeText(text); toast('복사했어요. 카톡에 붙여넣어(Ctrl+V) 보내 주세요', 4000); } catch { toast('복사하지 못했어요. 직접 선택해서 복사해 주세요'); }
+}
 // 기도문 크게 보기와 같은 전체 화면 안내 창
 function openSheet(html) {
   const r = $('#reader');
@@ -1032,7 +1110,7 @@ const Sync = {
     }
     if (m.audioPurged) return;
     for (const s of allSegs(m)) {
-      const k = audioKey(m, s); if (s.status === 'recording' || meta.a[k]) continue;
+      const k = audioKey(m, s); if (s.status === 'recording' || s.imported || meta.a[k]) continue;
       const b = await getAudio(k); if (!b) continue;
       this.note = `녹음 올리는 중… (${shortDate(m.date)} ${s.kind === 'sermon' ? '설교' : '나눔'} ${s.idx + 1}번째 구간)`; View.syncStatus?.();
       try { await this.post({ op: 'audio', k, type: b.type, b64: await blobToB64(b) }); }
@@ -1249,7 +1327,8 @@ const View = {
         <button id="pickMain">선택</button></div></div>` : ''}
       ${showInstall ? `<div class="card flat"><b>📲 바탕화면에 앱 추가</b>
         <p class="muted" style="margin:4px 0 10px">앱처럼 바로 열리고 기록도 안전하게 보관돼요.</p>${Install.button()}
-        <button class="small ghost" id="hideInstall" style="margin-top:6px">나중에</button></div>` : ''}
+        ${isPC() ? bookmarkHint() : ''}
+        <button class="small ghost" id="hideInstall" style="margin-top:6px">${isPC() ? '알겠어요 (닫기)' : '나중에'}</button></div>` : ''}
       ${!setup && Collect.ready() ? `<div class="card flat"><div class="row"><div class="grow"><b>📱 순원 초대 QR</b><div class="muted">순원들이 노트를 쓰고 기도제목을 보내요.</div></div>
         <button id="homeQR">QR 보기</button></div></div>` : ''}
       <div class="card"><h2>지난 모임</h2>
@@ -1384,12 +1463,13 @@ const View = {
     const link = Collect.joinLink(); const qr = qrcode(0, 'M'); qr.addData(link); qr.make();
     openSheet(`<h2 style="text-align:center">${esc(settings.groupName || '순모임')} 순원 초대</h2>
       <div class="qrbox">${qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true, alt: '순원 초대 QR 코드' })}</div>
-      <ol class="steplist" style="margin-top:16px"><li>순원이 <b>휴대폰 카메라</b>로 QR을 찍어요</li><li>열린 화면에서 <b>이름</b>을 적고</li><li><b>"바탕화면에 앱 추가"</b>를 눌러요</li></ol>
-      <div class="row" style="margin-top:12px"><button class="grow" id="qrCopy">링크 복사</button><button class="grow" id="qrShare">카톡으로 보내기</button></div>
-      <p class="hint" style="text-align:center">QR에는 기도제목을 보내는 주소만 들어 있어요. 순원은 다른 사람의 기도제목을 볼 수 없어요.</p>`);
+      <ol class="steplist" style="margin-top:16px">${isPC()
+        ? '<li>모여 있으면 순원이 이 화면의 QR을 <b>휴대폰 카메라</b>로 찍어요</li><li>떨어져 있으면 아래 <b>카톡용 글 복사</b> → 카톡 PC에서 순원(또는 순 단톡방)에 <b>Ctrl+V</b>로 보내요</li><li>순원이 링크를 열어 <b>이름</b>을 적고 <b>"바탕화면에 앱 추가"</b>를 눌러요</li>'
+        : '<li>순원이 <b>휴대폰 카메라</b>로 QR을 찍어요</li><li>열린 화면에서 <b>이름</b>을 적고</li><li><b>"바탕화면에 앱 추가"</b>를 눌러요</li>'}</ol>
+      <div class="row" style="margin-top:12px"><button class="grow" id="qrCopy">링크 복사</button><button class="grow" id="qrShare">${isPC() ? '카톡용 글 복사' : '카톡으로 보내기'}</button></div>
+      <p class="hint" style="text-align:center">QR·링크에는 기도제목을 보내는 주소만 들어 있어요. 순원은 다른 사람의 기도제목을 볼 수 없어요.</p>`);
     $('#qrCopy').onclick = () => copy(link);
-    $('#qrShare').onclick = async () => { const text = `🌿 ${settings.groupName || '순모임'} 순원 노트\n아래 링크를 눌러 이름을 적고 "바탕화면에 앱 추가"를 눌러 주세요.\n${link}`;
-      if (navigator.share) { try { await navigator.share({ text }); } catch {} } else copy(text); };
+    $('#qrShare').onclick = () => shareText(`🌿 ${settings.groupName || '순모임'} 순원 노트\n아래 링크를 눌러 이름을 적고 "바탕화면에 앱 추가"를 눌러 주세요.\n${link}`);
   },
   // 다른 기기 연결: QR(폰 카메라로) + 링크(컴퓨터·카톡 나에게 보내기)
   showLink(withKeys) {
@@ -1399,11 +1479,12 @@ const View = {
       <div class="qrbox">${qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true, alt: '기기 연결 QR 코드' })}</div>
       <ol class="steplist" style="margin-top:16px"><li><b>폰:</b> 카메라로 QR을 찍어요</li><li><b>컴퓨터:</b> 링크를 복사해서 (카톡 "나와의 채팅"·메일로 보내) 브라우저 주소창에 붙여넣어요</li><li>링크가 열리면 연결되고 기록을 자동으로 가져와요 (이미 쓰던 기기면 <b>확인</b>을 한 번 눌러요)</li></ol>
       <label class="check" style="margin-top:12px"><input type="checkbox" id="lkKeys" ${withKeys ? 'checked' : ''}> AI 키도 함께 (그 기기에서도 녹음 정리까지 하려면)</label>
-      <div class="row" style="margin-top:12px"><button class="grow" id="lkCopy">링크 복사</button><button class="grow" id="lkShare">보내기</button></div>
+      <div class="row" style="margin-top:12px"><button class="grow" id="lkCopy">링크 복사</button>${isPC() ? '' : '<button class="grow" id="lkShare">보내기</button>'}</div>
+      ${isPC() ? '<p class="muted" style="margin-top:8px">컴퓨터에서는 <b>링크 복사</b> → 카톡 PC <b>"나와의 채팅"</b>에 <b>Ctrl+V</b>로 보내고, 폰에서 그 링크를 길게 눌러 복사해 앱의 <b>🔗 연결 링크 붙여넣기</b>에 넣어요. (폰 카메라로 위 QR을 찍어도 돼요)</p>' : ''}
       <p class="hint" style="text-align:center">⚠️ 이 링크는 순모임 기록 전체를 여는 열쇠예요${withKeys ? ' (AI 키 포함)' : ''}. 본인 기기에만 쓰고, 단체방에는 올리지 마세요.</p>`);
     $('#lkKeys').onchange = e => View.showLink(e.target.checked);
     $('#lkCopy').onclick = () => copy(link);
-    $('#lkShare').onclick = async () => { if (navigator.share) { try { await navigator.share({ title: '순모임 노트 연결', text: link }); } catch {} } else copy(link); };
+    $('#lkShare')?.addEventListener('click', () => shareText(link, '순모임 노트 연결'));
   },
   // 아이폰 사파리에서 연결한 경우: 바탕화면 앱은 저장 공간이 따로라 한 번 더 붙여넣어야 한다
   linkedIOS() {
@@ -1489,13 +1570,13 @@ const View = {
       $('#app').innerHTML = bar + `<div class="card accent"><h2>3. 준비 끝! 🎉</h2>
           <p>모임 때 이 세 가지만 기억해 주세요.</p>
           <ol class="howto" style="font-size:16px">
-            <li><b>폰은 테이블 한가운데</b>, 화면이 위로 오게 (밑에 냅킨 한 장)</li>
+            <li>${isPC() ? '<b>노트북(또는 폰)은 테이블 한가운데</b>, 덮개는 열어 두고 전원 연결' : '<b>폰은 테이블 한가운데</b>, 화면이 위로 오게 (밑에 냅킨 한 장)'}</li>
             <li>순서를 넘길 때 <b>"○○ 집사님 이야기 들어볼까요?"</b> 하고 이름 불러 주기</li>
             <li>마무리 기도 전에 <b>기도제목을 읽어 드리고 확인</b>하기</li>
           </ol></div>
         ${canPickFolder ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 (노트북)</b><div class="muted">"2026엘림 순모임" 같은 Google Drive 폴더를 고르면 자동 저장돼요.</div></div>
           <button id="wFolder">${Folder.main ? '✅ ' + esc(Folder.main.name) : '선택'}</button></div></div>` : ''}
-        ${!isStandalone() ? `<div class="card flat"><b>📲 홈 화면에 추가</b><p class="muted" style="margin:4px 0 0">${isIOS() ? 'Safari 공유 버튼(□↑) → "홈 화면에 추가"' : 'Chrome ⋮ → "홈 화면에 추가"'}</p></div>` : ''}`;
+        ${!isStandalone() ? `<div class="card flat"><b>${isPC() ? '⭐ 크롬에서 열기' : '📲 홈 화면에 추가'}</b>${isPC() ? bookmarkHint() : `<p class="muted" style="margin:4px 0 0">${isIOS() ? 'Safari 공유 버튼(□↑) → "홈 화면에 추가"' : 'Chrome ⋮ → "홈 화면에 추가"'}</p>`}</div>` : ''}`;
       $('#wFolder')?.addEventListener('click', async () => { try { await Folder.pick('main'); View.wizard(3); } catch (e) { if (e.name !== 'AbortError') toast('실패: ' + e.message, 5000); } });
       dock(`<button class="primary big" id="wDone">시작하기</button>`, d => $('#wDone', d).onclick = () => View.home());
     }
@@ -1530,6 +1611,8 @@ const View = {
       <div class="card"><h2>녹음</h2>
         <label class="f" for="sDays">이 기기의 녹음 파일 보관 기간 (지나면 음성만 지우고 글·요약은 남겨요${Sync.on() ? '. Drive 동기화 폴더의 녹음은 계속 보관돼요' : ''})</label>
         <select id="sDays">${[[7, '1주'], [28, '4주'], [90, '3개월'], [0, '지우지 않음']].map(([v, l]) => `<option value="${v}" ${+settings.audioDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        ${isPC() ? `<label class="f">마이크 (노트북)</label>
+        <div class="row"><div class="grow muted" id="micName">${settings.micId ? '고른 마이크' : '기본 마이크'}</div><button class="small" id="micTest">🎤 확인·고르기</button></div>` : ''}
       </div>
 
       <div class="card"><h2>📁 저장 폴더</h2>
@@ -1612,6 +1695,8 @@ const View = {
       saveSettings(settings); purgeOldAudio(); toast('저장했어요'); View.home();
     });
     $$('input[name=eng]').forEach(r => r.onchange = () => $('#oaBox').classList.toggle('hidden', r.value !== 'precise' || !r.checked));
+    $('#micTest')?.addEventListener('click', () => View.micTest());
+    View.micName();
     $('#keyTest').onclick = async () => {
       $('#keyMsg').textContent = '확인 중…';
       const precise = $('input[name=eng]:checked')?.value === 'precise';
@@ -1708,6 +1793,7 @@ const View = {
             <div class="muted" id="sStat"></div></div>
         </div>
         <p class="muted" style="margin:10px 0 0">녹음하면 끝나고 설교의 핵심·대지·적용을 정리해 드려요. 녹음 중에는 화면을 켜 두세요.</p>
+        ${recS ? '' : `<div class="row" style="margin-top:10px;flex-wrap:wrap">${importBtn('sImp', '📂 설교 녹음 파일 불러오기')}</div><p class="muted" id="sImp" style="margin:6px 0 0;font-size:14px"></p>`}
       </div>
       ${s.summary ? sermonCard(s.summary) : ''}
       <div class="row" style="margin-bottom:14px"><button class="${s.summary ? '' : 'primary'} grow" id="sSum">${s.summary ? '설교 다시 정리하기' : '✨ 설교 정리하기'}</button></div>
@@ -1734,6 +1820,7 @@ const View = {
       try { await Rec.start(m, 'sermon'); View.render(); } catch (e) { Rec.active = false; toast('마이크를 쓸 수 없어요: ' + e.message, 5000); }
     };
     $('#sSum').onclick = () => View.summarizeSermon();
+    bindImport('sImp', 'sermon');
     $('#pDate').onchange = e => { m.date = e.target.value; saveMeeting(m); };
     $('#pTitle').onchange = e => { m.title = e.target.value; m.titleEdited = true; saveMeeting(m); };
     $('#pDel').onclick = async () => { if (Rec.on) return toast('녹음 중에는 지울 수 없어요'); if (confirm(`이 모임과 녹음을 ${Sync.on() ? '모든 기기(폰·컴퓨터)에서' : '이 기기에서'} 지울까요? 되돌릴 수 없습니다.`)) { await delMeeting(m); Sync.remove(m); View.home(); } };
@@ -1811,9 +1898,11 @@ const View = {
           <button class="recbtn ${recOn ? 'on' : ''}" id="recBtn" aria-label="${recOn ? '녹음 멈춤' : '녹음 시작'}">${recOn ? '멈춤' : started ? '이어서' : '시작'}</button>
           <div class="grow"><div class="timer" id="timer">${fmt(m.startedAt && recOn ? Date.now() - m.startedAt : lastEnd(m))}</div>
             <div class="meter" aria-hidden="true"><i id="${recOn ? 'meter' : 'meterOff'}"></i></div>
-            <div class="muted">${recOn ? (eng === 'free' ? '듣고 있어요 · 약 1분마다 노트가 채워져요' : '듣고 있어요 · 5분마다 노트가 채워져요') : started ? '멈춰 있어요' : '폰을 테이블 가운데에 두고 시작하세요'}</div></div>
+            <div class="muted">${recOn ? (eng === 'free' ? '듣고 있어요 · 약 1분마다 노트가 채워져요' : '듣고 있어요 · 5분마다 노트가 채워져요') + (isPC() ? ' · 노트북 덮개는 열어 두세요' : '') : started ? '멈춰 있어요' : isPC() ? '노트북을 테이블 가운데에 두고 시작하세요' : '폰을 테이블 가운데에 두고 시작하세요'}</div></div>
         </div>
         ${!started && !recOn ? '<p class="muted" style="margin:12px 0 0">시작하기 전에 순원들께 녹음 양해를 구해 주세요.</p>' : ''}
+        ${!recOn ? `<div class="row" style="margin-top:12px;flex-wrap:wrap">${isPC() ? '<button class="small" id="micBtn">🎤 <span id="micNow">마이크 확인</span></button>' : ''}${importBtn('imp')}</div>
+          <p class="muted" id="impStat" style="margin:8px 0 0;font-size:14px">${started ? '' : '폰 녹음 앱(음성 메모·삼성 녹음 등)으로 녹음했다면 그 파일을 불러와도 똑같이 정리돼요.'}</p>` : ''}
         ${p?.opening_prayer ? `<button class="small" id="rdOpen" style="margin-top:12px">🙏 시작 기도 크게 보기</button>` : ''}
       </div>
       <div id="qcard"></div>
@@ -1828,18 +1917,16 @@ const View = {
     dock(started || recOn ? `<button class="primary big" id="toSum">🙏 나눔 끝 · 마무리 기도 준비</button>` : '', d => $('#toSum', d).onclick = async () => {
       if (shareRec()) await Rec.stop(); View.go('sum'); View.startFinalWhenReady(); });
     $('#stopSermon')?.addEventListener('click', async () => { await Rec.stop(); View.render(); });
+    $('#micBtn')?.addEventListener('click', () => View.micTest());
+    if ($('#micNow')) View.micName();
+    bindImport('imp', 'share');
     $('#rdOpen')?.addEventListener('click', () => openReader('시작 기도', p.opening_prayer));
     $('#recBtn').onclick = async () => {
       if (recOn) { await Rec.stop(); View.render(); return; }
       if (sermonOn) return toast('설교 녹음을 먼저 멈춰 주세요');
       if (!settings.members.length) return toast('설정에서 순원 이름을 먼저 넣어 주세요');
       if (!keysReady(eng)) return toast('설정에서 AI 키를 먼저 넣어 주세요');
-      if (!m.consentAt) {
-        const days = +settings.audioDays ? `${settings.audioDays}일 동안` : '지울 때까지';
-        const svc = eng === 'free' ? 'Groq·Anthropic' : 'OpenAI·Anthropic';
-        if (!confirm(`녹음 전에 순원들께 알려 주세요:\n\n• 오늘 나눔이 녹음됩니다.\n• 글로 바꾸고 요약하기 위해 AI 서비스(${svc})로 전송됩니다.\n• 녹음은 이 기기에만 ${days} 보관됩니다.\n• 단톡방에는 동의한 분의 기도제목만 올립니다.\n\n모두 동의하셨나요?`)) return;
-        m.consentAt = Date.now(); saveMeeting(m);
-      }
+      if (!consentOK(m)) return;
       try { await Rec.start(m, 'share'); View.markQuestion(); View.render(); } catch (e) { Rec.active = false; toast('마이크를 쓸 수 없어요: ' + e.message, 5000); }
     };
     $$('.speakers button').forEach(b => b.onclick = () => {
@@ -2006,10 +2093,10 @@ const View = {
         ${f ? '<button id="reSum" style="margin-top:12px">고친 내용으로 다시 정리</button>' : ''}</details>` : ''}
       ${kakaoReady ? `<div class="card flat"><h2>📁 저장</h2><p class="muted" id="saveStat"></p>
         <button id="saveBtn">${canPickFolder ? (Folder.ready() ? '지금 폴더에 저장' : '폴더 연결하기') : 'Drive에 저장'}</button></div>` : ''}`;
-    dock(kakaoReady && !View._finalRunning ? `<button class="primary big" id="share">💬 카톡으로 보내기</button>` : '', d => $('#share', d).onclick = async () => {
+    dock(kakaoReady && !View._finalRunning ? `<button class="primary big" id="share">${isPC() ? '💬 카톡용 글 복사' : '💬 카톡으로 보내기'}</button>` : '', d => $('#share', d).onclick = async () => {
       const text = $('#kakao')?.value ?? m.kakao;
       if (!kakaoPeople(m).length && !confirm('단톡방 공유에 동의한 분이 없어서 인사와 기도문만 올라가요. 보낼까요?')) return;
-      if (navigator.share) { try { await navigator.share({ text }); } catch {} } else { copy(text); toast('복사했어요. 카톡 단톡방에 붙여넣어 주세요'); }
+      await shareText(text);
       if (!canPickFolder && needsExport(m)) setTimeout(() => toast('기록 보관을 위해 아래 "Drive에 저장"도 눌러 주세요', 5000), 800);
     });
     $('#sumGo')?.addEventListener('click', () => View.startFinalWhenReady());
@@ -2067,6 +2154,60 @@ const View = {
       </ol>
       <p class="hintbox"><b>이 폰의 기록은 그대로 남아요</b>연결되면 이 기기에 있던 모임과 녹음이 자동으로 Drive에 올라가고, 컴퓨터에서도 보여요.</p>`);
   },
+  // 노트북 마이크 확인: 녹음할 마이크를 고르고 소리 막대로 잘 들리는지 본다
+  micTest() {
+    if (Rec.on) return toast('녹음 중에는 마이크를 바꿀 수 없어요');
+    openSheet(`<h2>🎤 마이크 확인</h2>
+      <label class="f" for="micSel">녹음할 마이크</label><select id="micSel"><option>불러오는 중…</option></select>
+      <div class="meter" style="height:14px;margin-top:16px" aria-hidden="true"><i id="micMeter"></i></div>
+      <p id="micMsg" class="muted">크롬 위쪽에 마이크 사용 창이 뜨면 <b>허용</b>(방문할 때마다 허용)을 눌러 주세요</p>
+      <ol class="steplist" style="margin-top:16px">
+        <li>노트북은 테이블 <b>한가운데</b>에 두세요. 회의용·USB 마이크가 있으면 위에서 골라 주세요</li>
+        <li><b>덮개를 닫거나 절전</b>되면 녹음이 멈춰요. 전원을 연결해 두세요</li>
+        <li>녹음 중에 다른 창을 써도 되지만 <b>이 크롬 창은 닫지 마세요</b></li>
+      </ol>`);
+    let stream = null, ac = null, iv = null;
+    const stop = () => { clearInterval(iv); ac?.close().catch(() => {}); stream?.getTracks().forEach(t => t.stop()); stream = ac = null; };
+    const say = t => { const el = $('#micMsg'); if (el) el.textContent = t; };
+    const start = async () => {
+      stop();
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: { ...Mic.constraint(), echoCancellation: false, noiseSuppression: true, autoGainControl: true } }); }
+      catch (e) { return say(e.name === 'NotAllowedError' ? '마이크가 막혀 있어요. 크롬 주소창 왼쪽 아이콘(사이트 설정) → 마이크 → 허용으로 바꾼 뒤 다시 열어 주세요.' : '마이크를 쓸 수 없어요: ' + e.message); }
+      if (!$('#micSel')) return stop();   // 그 사이 창을 닫음
+      ac = new AudioContext(); const an = ac.createAnalyser(); an.fftSize = 1024; ac.createMediaStreamSource(stream).connect(an);
+      const buf = new Float32Array(an.fftSize); let peak = 0;
+      iv = setInterval(() => {
+        an.getFloatTimeDomainData(buf); let s = 0; for (const v of buf) s += v * v; const rms = Math.sqrt(s / buf.length);
+        peak = Math.max(peak * 0.98, rms); const el = $('#micMeter'); if (el) el.style.width = Math.min(100, rms * 900) + '%';
+        say(peak > 0.02 ? '✅ 잘 들려요' : peak > 0.006 ? '조금 작게 들려요 · 마이크 가까이에서 말해 보세요' : '말해 보세요 · 막대가 움직이면 잘 들리는 거예요');
+      }, 150);
+      const ds = await Mic.list();
+      $('#micSel').innerHTML = ds.map(d => `<option value="${esc(d.deviceId)}" ${d.deviceId === (settings.micId || 'default') ? 'selected' : ''}>${esc(Mic.label(d))}</option>`).join('') || '<option>마이크를 찾지 못했어요</option>';
+    };
+    $('#micSel').onchange = e => { settings.micId = e.target.value === 'default' ? '' : e.target.value; saveSettings(settings); start(); };
+    const close = $('#rdClose').onclick;
+    $('#rdClose').onclick = () => { stop(); close(); View.micName(); };
+    start();
+  },
+  async micName() { const n = await Mic.current(); if (!n) return; for (const el of [$('#micName'), $('#micNow')]) if (el) el.textContent = n; },
+  // 폰 녹음 앱(음성 메모·삼성 녹음 등)으로 녹음한 파일을 불러와 글로 바꾼다
+  async importFiles(kind, files) {
+    const m = current; if (!m || !files.length) return;
+    if (Rec.on) return toast('녹음 중에는 불러올 수 없어요. 먼저 멈춰 주세요');
+    if (kind === 'sermon') { if (!settings.groqKey && !settings.openaiKey) return toast('설정에서 Groq 키를 먼저 넣어 주세요'); }
+    else {
+      if (!settings.members.length) return toast('설정에서 순원 이름을 먼저 넣어 주세요');
+      if (!keysReady(engineOf(m))) return toast('설정에서 AI 키를 먼저 넣어 주세요');
+      if (!consentOK(m)) return;
+    }
+    const id = kind === 'sermon' ? '#sImp' : '#impStat';
+    const say = t => { const el = $(id); if (el) el.innerHTML = `<span class="spin"></span> ${esc(t)}`; };
+    try {
+      const r = await importAudio(m, kind, files, say);
+      toast(`${fmt(r.ms)} 분량을 ${r.n}구간으로 나눴어요. 글로 바꾸는 중이에요`, 4000);
+    } catch (e) { console.error(e); toast('불러오지 못했어요: ' + e.message, 7000); }
+    if (current === m) View.render();
+  },
   saveStatus() {
     const el = $('#saveStat'), m = current; if (!el || !m) return;
     const when = t => new Date(t).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
@@ -2095,6 +2236,21 @@ const View = {
   },
 };
 const shareRec = () => Rec.on && Rec.kind === 'share';
+// 나눔 녹음(또는 녹음 파일 불러오기) 전에 한 번 순원들의 동의를 확인한다
+function consentOK(m) {
+  if (m.consentAt) return true;
+  const days = +settings.audioDays ? `${settings.audioDays}일 동안` : '지울 때까지';
+  const svc = engineOf(m) === 'free' ? 'Groq·Anthropic' : 'OpenAI·Anthropic';
+  if (!confirm(`녹음 전에 순원들께 알려 주세요:\n\n• 오늘 나눔이 녹음됩니다.\n• 글로 바꾸고 요약하기 위해 AI 서비스(${svc})로 전송됩니다.\n• 녹음은 이 기기에만 ${days} 보관됩니다.\n• 단톡방에는 동의한 분의 기도제목만 올립니다.\n\n모두 동의하셨나요?`)) return false;
+  m.consentAt = Date.now(); saveMeeting(m); return true;
+}
+// 녹음 파일 불러오기 버튼 (input은 숨겨 두고 버튼으로 연다)
+const importBtn = (id, label = '📂 녹음 파일 불러오기') => `<button class="small" id="${id}Btn">${label}</button><input id="${id}File" type="file" accept="audio/*,video/*,.m4a,.aac,.amr,.3gp,.mp3,.wav" multiple hidden>`;
+function bindImport(id, kind) {
+  const b = $('#' + id + 'Btn'), f = $('#' + id + 'File'); if (!b || !f) return;
+  b.onclick = () => f.click();
+  f.onchange = () => { const files = [...f.files]; f.value = ''; View.importFiles(kind, files); };
+}
 function sermonCard(x) {
   return `<div class="card accent"><h2>✨ 설교 정리</h2>
     <p style="font-size:18px;font-weight:700;line-height:1.6">${esc(x.main_message)}</p>
@@ -2152,7 +2308,9 @@ purgeOldAudio().catch(console.error);
 retrySweep().catch(console.error);
 Install.init();
 { const j = parseJoin(location.search);
-  if (j && (settings.role === 'member' || !hasLeaderSetup() || confirm('순원 초대 링크예요. 이 기기를 순원 모드로 바꿀까요? (순장 설정은 그대로 남아요)'))) applyJoin(j); }
+  // 즐겨찾기·바탕화면 앱이 언제나 같은 주소로 열리도록 참여 정보는 주소에서 지운다
+  if (j) history.replaceState(null, '', location.pathname + location.hash);
+  if (j &&(settings.role === 'member' || !hasLeaderSetup() || confirm('순원 초대 링크예요. 이 기기를 순원 모드로 바꿀까요? (순장 설정은 그대로 남아요)'))) applyJoin(j); }
 // 다른 기기에서 보낸 연결 링크로 열었을 때 (주소에서는 바로 지운다)
 if (location.hash.includes('link=')) {
   const href = location.href, o = Link.parse(location.hash);
