@@ -169,8 +169,11 @@ async function postAudio(url, key, form, name) {
     const e = new Error(`${name} 연결 실패 — 인터넷 연결을 확인해 주세요. (자동으로 다시 시도해요)`); e.status = 0; throw e;
   }
   if (!r.ok) {
-    let t = ''; try { t = (await r.json()).error?.message || ''; } catch {}
-    const e = new Error(r.status === 401 ? `${name} 키가 올바르지 않아요.` : r.status === 429 ? `${name} 무료 사용량이 잠시 찼어요. 조금 뒤 자동으로 다시 해요.` : `${name} ${r.status} ${t}`);
+    let t = '', code = ''; try { const er = (await r.json()).error || {}; t = er.message || ''; code = er.code || er.type || ''; } catch {}
+    // 잔액이 없으면 기다려도 안 되니 충전 안내를 하고 자동 재시도는 멈춘다 (충전 뒤 "다시"를 누르면 됨)
+    if (/insufficient_quota|credit_balance|billing/i.test(code + ' ' + t))
+      throw fatal(`${name} 잔액이 없어요. ${name === 'OpenAI' ? 'platform.openai.com → Settings → Billing' : '결제 화면'}에서 충전한 뒤 "다시"를 눌러 주세요.`);
+    const e = new Error(r.status === 401 ? `${name} 키가 올바르지 않아요.` : r.status === 429 ? `${name} 사용량이 잠시 찼어요. 조금 뒤 자동으로 다시 해요.` : `${name} ${r.status} ${t}`);
     e.status = r.status; throw e;
   }
   return r.json();
