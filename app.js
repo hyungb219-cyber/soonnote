@@ -268,6 +268,7 @@ const SYS_BASE = `당신은 한국 교회 소그룹(순모임)을 돕는 조용�
 const Rec = {
   stream: null, cur: null, timer: null, tick: null, health: null, vad: null, ac: null, an: null, wakeLock: null,
   meeting: null, kind: 'share', active: false, downSince: 0, recovering: false, lastLoud: 0, floor: 0,
+  source: 'mic', display: null,   // source 'tab': 노트북 크롬의 다른 탭(유튜브 설교) 소리를 녹음
   get on() { return this.active; },
   eng() { return ENGINES[engineOf(this.meeting)]; },
   // 설교는 한 사람이 길게 말하니 구간을 더 길게 (요청 수를 줄임)
@@ -276,19 +277,31 @@ const Rec = {
   list() { const m = this.meeting; return this.kind === 'sermon' ? (m.sermonSegs = m.sermonSegs || []) : (m.segments = m.segments || []); },
   mime() { for (const t of ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm']) if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t; return ''; },
   async openStream() {
+    if (this.source === 'tab') return this.openTab();
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { ...Mic.constraint(), echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
     this.stream.getAudioTracks()[0].onended = () => this.markDown();
     this.startLevel();
   },
-  async start(m, kind = 'share') {
-    this.meeting = m; this.kind = kind;
+  // 크롬 "공유할 탭 고르기" 창에서 유튜브 탭과 "탭 오디오 공유"를 고르면 그 소리만 녹음한다 (화면은 녹화하지 않음)
+  async openTab() {
+    const d = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      preferCurrentTab: false, selfBrowserSurface: 'exclude', systemAudio: 'include', surfaceSwitching: 'include' });
+    const a = d.getAudioTracks()[0];
+    if (!a) { d.getTracks().forEach(t => t.stop()); throw new Error('탭 소리가 공유되지 않았어요. 창 아래쪽 "탭 오디오도 공유"를 켜고 다시 해 주세요'); }
+    this.display = d; this.stream = new MediaStream([a]);
+    // 크롬의 "공유 중지"를 누르면 설교가 끝난 것으로 보고 녹음을 마친다
+    a.onended = () => { if (this.active && this.source === 'tab') View.tabShareEnded(); };
+    this.startLevel();
+  },
+  async start(m, kind = 'share', source = 'mic') {
+    this.meeting = m; this.kind = kind; this.source = source;
     await this.openStream();
     this.active = true;
     if (kind === 'sermon') { if (!m.sermonStartedAt) m.sermonStartedAt = Date.now(); await saveMeeting(m); }
     else { if (!m.startedAt) m.startedAt = Date.now(); m.status = 'recording'; await saveMeeting(m); }
     await this.lockScreenOn();
     this.newSegment();
-    setTimeout(() => { if (this.active && Mic.blocked(this.stream)) toast(Mic.BLOCKED, 12000); }, 1500);
+    if (source === 'mic') setTimeout(() => { if (this.active && Mic.blocked(this.stream)) toast(Mic.BLOCKED, 12000); }, 1500);
     this.tick = setInterval(() => View.updateTimer(), 500);
     this.health = setInterval(() => this.check(), 2000);
   },
@@ -340,7 +353,7 @@ const Rec = {
   },
   markDown() { if (this.active && !this.downSince) this.downSince = Date.now(); },
   check() {
-    if (!this.active || this.recovering) return;
+    if (!this.active || this.recovering || this.source === 'tab') return;   // 탭 녹음은 "공유 중지"로 끝난다 (다시 묻지 않게)
     const tr = this.stream?.getAudioTracks()[0];
     if (!tr || tr.readyState === 'ended' || !this.cur || this.cur.r.state !== 'recording') this.markDown();
     if (this.downSince && document.visibilityState === 'visible') this.recover();
@@ -374,8 +387,8 @@ const Rec = {
     clearTimeout(this.timer); clearInterval(this.tick); clearInterval(this.health); clearInterval(this.vad);
     const c = this.cur; this.cur = null;
     if (c && c.r.state !== 'inactive') c.r.stop();
-    const s = this.stream; this.stream = null;
-    setTimeout(() => s?.getTracks().forEach(t => t.stop()), overlap + 500);
+    const s = this.stream, d = this.display; this.stream = null; this.display = null; this.source = 'mic';
+    setTimeout(() => { s?.getTracks().forEach(t => t.stop()); d?.getTracks().forEach(t => t.stop()); }, overlap + 500);
     this.ac?.close().catch(() => {}); this.ac = null;
     try { this.wakeLock?.release(); } catch {}
     const m = this.meeting; if (m) { if (this.kind === 'share') m.status = 'recorded'; await saveMeeting(m); }
@@ -432,7 +445,9 @@ async function importAudio(m, kind, files, say) {
   const start = list.length ? list.at(-1).startMs + list.at(-1).durMs : 0;
   let at = start, n = 0;
   for (const [fi, f] of files.entries()) {
-    say(`파일 여는 중… ${files.length > 1 ? `(${fi + 1}/${files.length}) ` : ''}${f.name}`);
+    // 예배 전체 영상처럼 아주 큰 파일은 기기 메모리가 모자랄 수 있다
+    if (f.size > 1.5e9) throw fatal(`"${f.name}"이(가) 너무 커요 (${(f.size / 1e9).toFixed(1)}GB). 설교 부분만 자른 파일이나 음성 파일을 올리거나, 유튜브 설교 소리 녹음을 써 주세요.`);
+    say(`파일 여는 중… ${files.length > 1 ? `(${fi + 1}/${files.length}) ` : ''}${f.name}${f.size > 3e8 ? ' (큰 파일이라 1~2분 걸려요)' : ''}`);
     let pcm;
     try { pcm = await decodeMono(f); }
     catch { throw fatal(`"${f.name}"을(를) 열 수 없어요. 녹음 파일(m4a·mp3·wav 등)인지 확인해 주세요. 아주 긴 파일은 나눠서 올려 주세요.`); }
@@ -719,14 +734,14 @@ ${tr || '(녹음 없음)'}
 }
 
 // ---------- 질문 준비: 설교 녹음에서 질문마다 답 · 인용 · 생각할 포인트 ----------
-const qprepSchema = obj({ items: { type: 'array', items: obj({ answer: str, quotes: strArr, points: strArr, hint: str }) } });
+const qprepSchema = obj({ items: { type: 'array', items: obj({ lead: str, followups: strArr, answer: str, quotes: strArr, sample: str, points: strArr }) } });
 async function runQuestionPrep(m, onText) {
   const qs = ensureQuestions(m); if (!qs.length) throw fatal('질문을 먼저 넣어 주세요. (주보를 올리거나 직접 추가)');
   const p = m.prep || {}, s = m.sermon || {}, tr = sermonText(m);
   const res = await claudeJSON({ model: ENGINES[settings.engine].model, effort: 'high', maxTokens: 24000, schema: qprepSchema, system: SYS_BASE,
     content: [{ type: 'text', text: `${groupInfo()}
 
-순장이 순모임을 준비합니다. 아래 나눔 질문마다, 오늘 설교에서 찾은 답과 순장이 미리 생각해 볼 거리를 만들어 주세요.
+순장이 순모임을 준비합니다. 아래 나눔 질문마다, 순장이 모임을 수월하게 진행하도록 진행 멘트·설교에서 찾은 답·모범 답변을 만들어 주세요.
 
 [오늘 설교] ${p.sermon_title || ''} (${p.scripture || ''})
 ${s.summary ? `핵심: ${s.summary.main_message}\n대지: ${s.summary.points.map(x => x.heading + ' - ' + x.detail).join(' / ')}\n적용: ${s.summary.applications.join(' / ')}` : ''}
@@ -739,9 +754,11 @@ ${qs.map((x, i) => `${i + 1}. ${x.q}`).join('\n')}
 질문 순서 그대로 items를 만들어 주세요 (질문 ${qs.length}개 = items ${qs.length}개).
 - answer: 이 질문에 대해 오늘 설교가 말한 답을 3~5문장으로. 설교자가 실제로 전한 내용(녹음·메모)에만 근거하고, 설교에 없는 해석을 더하지 않습니다. 질문이 개인의 경험을 묻는 질문이면, 설교가 그 질문과 관련해 준 관점·권면을 정리합니다. 설교에서 직접 다루지 않았으면 "설교에서 직접 다루지 않았어요."로 시작하고 본문 말씀에 비춘 짧은 방향만 적습니다.
 - quotes: 이 질문과 관련해 설교에서 나온 핵심 문장이나 성경 구절 0~2개 (녹음에 있는 표현을 살려서, 짧게).
-- points: 2~3개의 짧은 생각할 포인트. 설교 내용(특히 순장의 메모)과 연결하고, 마음·감정과 실생활 적용 쪽으로. 가르치는 말투가 아니라 스스로 돌아보게 하는 말투.
-- hint: 순장이 먼저 나눌 때 참고할 답변 방향 한두 문장 (일상적인 소재로, 깊은 고백을 요구하지 않게).` }], onText });
-  res.items.forEach((it, i) => { if (qs[i]) Object.assign(qs[i], { answer: it.answer, quotes: it.quotes, points: it.points, hint: it.hint }); });
+- lead: 순장이 이 질문을 꺼낼 때 그대로 읽을 1~2문장의 진행 멘트. 앞 질문에서 자연스럽게 넘어가고, 부담 없이 말할 수 있게 여는 말투 (예: "오늘 말씀에서 ~라고 하셨잖아요. 그래서 이번에는 ~ 이야기해 볼까요?").
+- followups: 답이 잘 나오지 않거나 짧게 끝날 때 이어서 물을 쉬운 보조 질문 2개. 예/아니오로 끝나지 않고, 일상의 구체적인 장면을 떠올리게 하는 질문.
+- sample: 순장이 먼저 나눌 수 있는 모범 답변 3~4문장. 순장 본인(1인칭)의 말투로, 설교 내용과 연결하되 일상적이고 솔직한 예시로 (거창한 간증이나 가르침이 아니게). 실제 사실처럼 단정하지 말고 순장이 자기 이야기로 바꿔 말하기 쉬운 틀로 씁니다.
+- points: 2~3개의 짧은 생각할 포인트. 설교 내용(특히 순장의 메모)과 연결하고, 마음·감정과 실생활 적용 쪽으로. 가르치는 말투가 아니라 스스로 돌아보게 하는 말투.` }], onText });
+  res.items.forEach((it, i) => { if (qs[i]) Object.assign(qs[i], { lead: it.lead, followups: it.followups, answer: it.answer, quotes: it.quotes, sample: it.sample, points: it.points, hint: '' }); });
   await saveMeeting(m);
 }
 
@@ -1811,8 +1828,14 @@ const View = {
             ${recS ? '<div class="meter" aria-hidden="true"><i id="meter"></i></div>' : ''}
             <div class="muted" id="sStat"></div></div>
         </div>
-        <p class="muted" style="margin:10px 0 0">녹음하면 끝나고 설교의 핵심·대지·적용을 정리해 드려요. 녹음 중에는 화면을 켜 두세요.</p>
-        ${recS ? '' : `<div class="row" style="margin-top:10px;flex-wrap:wrap">${importBtn('sImp', '📂 설교 녹음 파일 불러오기')}</div><p class="muted" id="sImp" style="margin:6px 0 0;font-size:14px"></p>`}
+        <p class="muted" style="margin:10px 0 0">${recS && Rec.source === 'tab' ? '유튜브 탭의 소리를 듣고 있어요. 설교가 끝나면 <b>멈춤</b>(또는 크롬 위쪽 <b>공유 중지</b>)을 누르면 설교 정리와 질문 답을 자동으로 만들어요.' : '녹음을 멈추면 설교 정리와 주보 질문의 답을 자동으로 만들어요. 녹음 중에는 화면을 켜 두세요.'}</p>
+        ${recS ? '' : `<div class="row" style="margin-top:10px;flex-wrap:wrap">${canTabRec() ? '<button class="small" id="sTab">🖥 유튜브 설교 소리 녹음</button>' : ''}${importBtn('sImp', '📂 설교 영상·음성 파일 불러오기')}</div><p class="muted" id="sImp" style="margin:6px 0 0;font-size:14px"></p>
+          ${canTabRec() ? `<details style="margin-top:8px"><summary style="font-size:15px">유튜브 설교 녹음하는 방법</summary><ol class="steplist" style="margin-top:8px">
+            <li>크롬 <b>다른 탭</b>에서 교회 유튜브 설교 영상을 열어 두세요 (설교 시작 부분에 맞춰 일시정지)</li>
+            <li>여기서 <b>🖥 유튜브 설교 소리 녹음</b> → 뜨는 창의 <b>Chrome 탭</b>에서 그 유튜브 탭을 고르고, 아래 <b>"탭 오디오도 공유"</b>가 켜져 있는지 확인 → <b>공유</b></li>
+            <li>유튜브 탭에서 재생하세요. 톱니바퀴 → 재생 속도 <b>1.25~1.5배</b>로 해도 돼요</li>
+            <li>설교가 끝나면 이 화면의 <b>멈춤</b> 또는 크롬 위쪽 <b>공유 중지</b> → 설교 정리와 질문 답이 자동으로 만들어져요</li></ol>
+            <p class="hint">영상·음성 파일이 있으면 <b>📂 파일 불러오기</b>가 더 빨라요 (1시간짜리 영상은 노트북에서 올려 주세요).</p></details>` : ''}`}
       </div>
       ${s.summary ? sermonCard(s.summary) : ''}
       <div class="row" style="margin-bottom:14px"><button class="${s.summary ? '' : 'primary'} grow" id="sSum">${s.summary ? '설교 다시 정리하기' : '✨ 설교 정리하기'}</button></div>
@@ -1841,6 +1864,12 @@ const View = {
     };
     $('#sSum').onclick = () => View.summarizeSermon();
     bindImport('sImp', 'sermon');
+    $('#sTab')?.addEventListener('click', async () => {
+      if (Rec.on) return toast('나눔 녹음이 켜져 있어요. 먼저 멈춰 주세요');
+      if (!settings.groqKey && !settings.openaiKey) return toast('설정에서 Groq 키를 먼저 넣어 주세요');
+      try { await Rec.start(m, 'sermon', 'tab'); toast('녹음 중이에요. 유튜브 탭에서 설교를 재생해 주세요', 5000); View.render(); }
+      catch (e) { Rec.active = false; Rec.source = 'mic'; Rec.display?.getTracks().forEach(t => t.stop()); Rec.display = null; if (e.name !== 'NotAllowedError') toast('탭 소리를 녹음할 수 없어요: ' + e.message, 6000); }
+    });
     $('#pDate').onchange = e => { m.date = e.target.value; saveMeeting(m); };
     $('#pTitle').onchange = e => { m.title = e.target.value; m.titleEdited = true; saveMeeting(m); };
     $('#pDel').onclick = async () => { if (Rec.on) return toast('녹음 중에는 지울 수 없어요'); if (confirm(`이 모임과 녹음을 ${Sync.on() ? '모든 기기(폰·컴퓨터)에서' : '이 기기에서'} 지울까요? 되돌릴 수 없습니다.`)) { await delMeeting(m); Sync.remove(m); View.home(); } };
@@ -1853,6 +1882,14 @@ const View = {
     el.innerHTML = Rec.on && Rec.kind === 'sermon' ? '듣고 있어요 · 1~3분마다 받아 적어요'
       : busy ? `<span class="spin"></span> 받아 적는 중… (${done}/${segs.length})`
       : segs.length ? `녹음 ${segs.length}구간 받아 적기 완료${err ? ` · ${err}구간 실패(자동 재시도)` : ''}` : '녹음하지 않아도 메모만으로 정리할 수 있어요';
+  },
+  // 크롬 "공유 중지"로 탭 녹음이 끝났을 때: 녹음을 마치고 설교 정리 + 질문 답
+  async tabShareEnded() {
+    const m = Rec.meeting; await Rec.stop();
+    toast('설교 녹음을 마쳤어요. 정리와 질문 답을 만드는 중이에요', 5000);
+    if (current !== m) return;
+    if (tab !== 'sermon') View.go('sermon'); else View.render();
+    if (settings.anthropicKey) View.summarizeSermon();
   },
   async summarizeSermon() {
     const m = current, b = $('#sSum'); if (!b || View._sermonRunning) return;
@@ -1981,7 +2018,7 @@ const View = {
         <div class="sec-h"><span class="pill">질문 ${i + 1} / ${n}</span><span class="kbd" style="margin-left:auto">← → 키로 넘기기</span></div>
         <div class="qtext">${esc(x.q)}</div>
         ${x.note?.trim() ? `<div class="mynote"><b>내 메모</b>${esc(x.note)}</div>` : `<div class="muted" style="margin-bottom:10px">적어 둔 메모가 없어요 · <a href="#" id="qGoPrep">질문 준비에서 적기</a></div>`}
-        ${x.answer || x.points?.length || x.hint ? `<details style="margin:10px 0 4px" ${x.answer ? 'open' : ''}><summary style="font-size:15px">${x.answer ? '📖 설교에서 찾은 답' : '생각할 포인트'}</summary>${qAnswerHTML(x)}</details>` : ''}
+        ${x.lead || x.answer || x.points?.length || x.hint ? `<details style="margin:10px 0 4px" ${x.lead || x.answer ? 'open' : ''}><summary style="font-size:15px">${x.lead || x.answer ? '🎤 진행 도우미 (멘트·설교의 답·모범 답변)' : '생각할 포인트'}</summary>${qAnswerHTML(x)}</details>` : ''}
         <div class="row" style="margin-top:10px"><button id="qPrev" ${i === 0 ? 'disabled' : ''}>‹ 이전</button><button class="primary grow" id="qNext">${i === n - 1 ? '기도제목 나눔 ›' : '다음 질문 ›'}</button></div>
       </div>`;
     }
@@ -2260,6 +2297,8 @@ const View = {
   },
 };
 const shareRec = () => Rec.on && Rec.kind === 'share';
+// 노트북 크롬: 다른 탭(유튜브) 소리 녹음이 되는지
+const canTabRec = () => isPC() && !!navigator.mediaDevices?.getDisplayMedia;
 // 나눔 녹음(또는 녹음 파일 불러오기) 전에 한 번 순원들의 동의를 확인한다
 function consentOK(m) {
   if (m.consentAt) return true;
@@ -2277,9 +2316,12 @@ function bindImport(id, kind) {
 }
 // 질문 하나에 대한 설교 속 답 · 핵심 말씀 · 생각할 포인트 · 내가 나눌 방향
 function qAnswerHTML(x) {
-  return (x.answer ? `<div class="mynote" style="margin-top:8px"><b>📖 설교에서 찾은 답</b>${esc(x.answer)}</div>` : '') +
+  return (x.lead ? `<div class="say" style="margin-top:8px"><b>🎤 진행 멘트</b> ${esc(x.lead)}</div>` : '') +
+    (x.followups?.length ? `<div class="hintbox"><b>답이 잘 안 나오면</b>${x.followups.map(f => '· ' + esc(f)).join('<br>')}</div>` : '') +
+    (x.answer ? `<div class="mynote" style="margin-top:8px"><b>📖 설교에서 찾은 답</b>${esc(x.answer)}</div>` : '') +
     (x.quotes?.length ? x.quotes.map(k => `<div class="say" style="margin:6px 0">“${esc(k)}”</div>`).join('') : '') +
     (x.points?.length ? `<ul class="points">${x.points.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : '') +
+    (x.sample ? `<div class="mynote" style="margin-top:8px"><b>🙋 내 모범 답변</b>${esc(x.sample)}</div>` : '') +
     (x.hint ? `<div class="hintbox"><b>내가 먼저 나눌 방향</b>${esc(x.hint)}</div>` : '');
 }
 function sermonCard(x) {
@@ -2314,7 +2356,7 @@ function mdText(m) {
     if (sm.notes?.trim()) md += `### 내 메모\n${sm.notes.trim()}\n\n`;
   }
   const qs = m.questions?.length ? m.questions : qList(m).map(q => ({ q }));
-  if (qs.length) md += `## 나눔 질문 준비\n${qs.map((x, i) => `### ${i + 1}. ${x.q}\n` + (x.answer ? `**설교에서 찾은 답:** ${x.answer}\n` : '') + (x.quotes?.length ? x.quotes.map(k => `> ${k}`).join('\n') + '\n' : '') + (x.points?.length ? x.points.map(t => `- ${t}`).join('\n') + '\n' : '') + (x.hint ? `- 답변 방향: ${x.hint}\n` : '') + (x.note?.trim() ? `\n**내 메모:** ${x.note.trim()}\n` : '')).join('\n')}\n`;
+  if (qs.length) md += `## 나눔 질문 준비\n${qs.map((x, i) => `### ${i + 1}. ${x.q}\n` + (x.lead ? `**진행 멘트:** ${x.lead}\n` : '') + (x.followups?.length ? x.followups.map(f => `- 보조 질문: ${f}`).join('\n') + '\n' : '') + (x.answer ? `**설교에서 찾은 답:** ${x.answer}\n` : '') + (x.sample ? `**내 모범 답변:** ${x.sample}\n` : '') + (x.quotes?.length ? x.quotes.map(k => `> ${k}`).join('\n') + '\n' : '') + (x.points?.length ? x.points.map(t => `- ${t}`).join('\n') + '\n' : '') + (x.hint ? `- 답변 방향: ${x.hint}\n` : '') + (x.note?.trim() ? `\n**내 메모:** ${x.note.trim()}\n` : '')).join('\n')}\n`;
   if (f) md += `## 한 명씩\n${f.flow}\n\n${f.people.map(p => `### ${p.name}\n${p.summary}\n${(p.prayer_requests || []).map(r => `- 🙏 ${r}`).join('\n')}`).join('\n\n')}\n\n## 마무리 기도 진행\n${f.closing.how_to}\n\n## 마무리 기도\n${f.closing.leader_prayer}\n\n## 카톡\n${m.kakao ?? buildKakao(m)}\n\n`;
   md += `## ${m.mode === 'notes' ? '메모' : '전사록'}\n${transcriptText(m)}\n`;
   return md;
