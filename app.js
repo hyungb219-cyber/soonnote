@@ -1491,13 +1491,10 @@ const View = {
         <p class="muted" style="margin-top:10px">참여한 순: <b>${esc(settings.member?.g || '')}</b></p></div>
       ${Install.needed() ? `<div class="card flat">${Install.button()}</div>` : ''}
       <div class="card flat"><h2>순원 모드</h2>
-        <p class="muted">노트는 이 기기에만 저장되고, 기도제목만 "보내기"를 누를 때 순장님 구글 시트로 전달돼요.</p>
-        <p class="muted">순장님 화면은 주소가 따로 있어요.</p>
-        <button id="msLeave">순장 화면 열기</button></div>`;
+        <p class="muted">노트는 이 기기에만 저장되고, 기도제목만 "보내기"를 누를 때 순장님 구글 시트로 전달돼요.</p></div>`;
     dock(`<button class="primary big" id="msSave">저장</button>`, d => $('#msSave', d).onclick = () => {
       const n = $('#msName').value.trim(); if (!n) return toast('이름을 적어 주세요');
       settings.memberName = n; saveSettings(settings); toast('저장했어요'); View.home(); });
-    $('#msLeave').onclick = () => location.assign(appBase());
   },
   // 순장: 순원 초대 QR
   showQR() {
