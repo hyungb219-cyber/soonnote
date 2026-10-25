@@ -2312,6 +2312,13 @@ navigator.storage?.persist?.().catch(() => {});   // 폰이 저장소를 임의�
 purgeOldAudio().catch(console.error);
 retrySweep().catch(console.error);
 Install.init();
+// 다른 탭·앱 창에서 설정을 저장하면 이 탭도 새 값으로 바꾼다 (열어 둔 예전 설정 화면에서 저장해 빈 값으로 덮어쓰지 않게)
+addEventListener('storage', e => {
+  if (e.key !== SKEY) return;
+  settings = loadSettings();
+  if (Rec.on || locked) return;
+  if (!current && $('#sGn')) { View.settings(); toast('다른 탭에서 바꾼 설정을 불러왔어요'); } else View.homeIfShown();
+});
 { const j = parseJoin(location.search);
   // 즐겨찾기·바탕화면 앱이 언제나 같은 주소로 열리도록 참여 정보는 주소에서 지운다
   if (j) history.replaceState(null, '', location.pathname + location.hash);
