@@ -385,7 +385,7 @@ const Mic = {
   label: d => d.deviceId === 'default' ? '기본 마이크 (Windows 설정) — ' + d.label.replace(/^(Default|기본값)\s*-\s*/i, '') : d.label || '마이크',
   // 크롬은 허용했는데 Windows(마이크 끄기 키·개인 정보 설정)가 막으면 소리 없이 녹음된다
   blocked: stream => !!stream?.getAudioTracks()[0]?.muted,
-  BLOCKED: '⚠️ Windows가 마이크를 막고 있어요 (소리가 0으로 들어와요). 노트북의 마이크 끄기 키(🎤 표시, 보통 F4 근처)를 눌러 풀거나, Windows 설정 → 개인 정보 및 보안 → 마이크 → "마이크 액세스"와 "데스크톱 앱이 마이크에 액세스하도록 허용"을 켜 주세요.',
+  BLOCKED: '⚠️ Windows가 마이크를 막고 있어요 (소리가 0으로 들어와요). ① 노트북의 마이크 끄기 키(🎤 표시, 보통 F4 근처)를 눌러 풀거나 ② Windows 설정 → 시스템 → 소리 → 입력 → 마이크 → 음소거 해제·입력 볼륨 올리기 ③ 설정 → 개인 정보 및 보안 → 마이크 → "데스크톱 앱이 마이크에 액세스하도록 허용" 켜기. 푼 뒤 이 창을 닫고 다시 열어 주세요.',
   async current() { const ds = await this.list(); const d = ds.find(x => x.deviceId === (settings.micId || 'default')) || ds[0]; return d && d.label ? this.label(d) : ''; },
 };
 
