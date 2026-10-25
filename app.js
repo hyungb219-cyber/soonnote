@@ -14,6 +14,8 @@ const ENGINES = {
   free: { label: '간편 · 무료', model: 'claude-sonnet-5', overlap: 300, minSeg: 40000, maxSeg: 90000 },
   precise: { label: '정밀 · 유료', model: 'claude-opus-5', overlap: 5000 },
 };
+// 정밀 방식은 이만큼씩 잘라 화자를 정리한다 (짧을수록 노트가 빨리 채워지고, 길수록 화자 판단에 맥락이 많다)
+const PRECISE_SEG_MIN = 2;
 const LOCK_AFTER_MS = 5 * 60 * 1000;     // 화면을 떠나 이 시간이 지나면 PIN 잠금
 const BASE_KEYWORDS = ['순모임','순장','순원','집사님','권사님','장로님','목사님','주보','설교','말씀','기도제목','찬양','큐티','은혜','하나님','예수님','성령님'];
 
@@ -314,7 +316,7 @@ const Rec = {
     if (this.cur) { const old = this.cur; setTimeout(() => old.r.state !== 'inactive' && old.r.stop(), this.eng().overlap); }
     this.cur = { r, seg, t0 };
     clearTimeout(this.timer);
-    if (engineOf(m) === 'precise' && this.kind === 'share') this.timer = setTimeout(() => this.active && !this.downSince && this.newSegment(), (settings.segMin || 5) * 60000);
+    if (engineOf(m) === 'precise' && this.kind === 'share') this.timer = setTimeout(() => this.active && !this.downSince && this.newSegment(), PRECISE_SEG_MIN * 60000);
     saveMeeting(m); View.refreshLive();
   },
   // 소리 크기를 재서 막대를 움직이고, 간편 방식에서는 말이 끊긴 순간에 구간을 나눈다
@@ -424,7 +426,7 @@ function wavBlob(f32) {
   return new Blob([v.buffer], { type: 'audio/wav' });
 }
 async function importAudio(m, kind, files, say) {
-  const sermon = kind === 'sermon', seg5 = (settings.segMin || 5) * 60;
+  const sermon = kind === 'sermon', seg5 = PRECISE_SEG_MIN * 60;
   const [minS, maxS] = sermon ? [90, 180] : engineOf(m) === 'free' ? [ENGINES.free.minSeg / 1000, ENGINES.free.maxSeg / 1000] : [seg5 - 30, seg5];
   const list = sermon ? (m.sermonSegs = m.sermonSegs || []) : (m.segments = m.segments || []);
   const start = list.length ? list.at(-1).startMs + list.at(-1).durMs : 0;
@@ -490,9 +492,12 @@ const Worker = {
       } else {
         if (!seg.textA) {
           seg.status = 'transcribing'; View.refreshLive();
-          const [a, b] = await Promise.allSettled([transcribeAccurate(blob, fname, m), transcribeDiarized(blob, fname)]);
-          if (a.status === 'rejected' && b.status === 'rejected') throw a.reason;
-          seg.textA = a.status === 'fulfilled' ? a.value : b.value.map(x => x.text).join(' ');
+          // 같은 구간을 세 번 받아 적는다: OpenAI 문장(A) · OpenAI 화자 구분(B) · Whisper(C, Groq 키가 있으면 무료)
+          const [a, b, c] = await Promise.allSettled([transcribeAccurate(blob, fname, m), transcribeDiarized(blob, fname),
+            settings.groqKey ? groqTranscribe(blob, fname, m) : Promise.resolve(null)]);
+          if (a.status === 'rejected' && b.status === 'rejected' && !c.value?.length) throw a.reason;
+          seg.textC = c.value?.length ? c.value.map(p => `${fmt(seg.startMs + p.start * 1000)} ${p.text}${p.low ? ' (?)' : ''}`).join('\n') : '';
+          seg.textA = a.status === 'fulfilled' ? a.value : b.status === 'fulfilled' ? b.value.map(x => x.text).join(' ') : c.value.map(p => p.text).join(' ');
           seg.diar = b.status === 'fulfilled' ? b.value : [];
           await saveMeeting(m);
         }
@@ -555,11 +560,14 @@ ${seg.textA || '(없음)'}
 [음성인식 B — 화자 구분(A,B,C… 는 이 구간 안에서만 유효한 임시 라벨)과 시간이 있음, 문장은 덜 정확할 수 있음]
 ${diar || '(없음)'}
 
+[음성인식 C — Whisper, 한국어 단어를 잘 잡는 편이고 시간이 있음, 조용한 곳에서 없는 말을 지어낼 때가 있음. "(?)"는 불확실]
+${seg.textC || '(없음)'}
+
 [바로 앞 구간의 마지막 발화${overlapped ? ` — 녹음이 약 ${ENGINES.precise.overlap / 1000}초 겹치므로, 이 구간 맨 앞의 같은 내용은 중복이니 빼 주세요` : ' — 앞 구간과 녹음이 끊겼다가 이어진 구간입니다'}]
 ${prevTail}
 
 작성 규칙:
-- 문장은 A를 기준으로 하고, B의 시간·화자 경계로 나눕니다. A와 B가 다르면 맥락상 더 자연스러운 쪽을 택합니다.
+- 문장은 A를 기준으로 하고, B의 시간·화자 경계로 나눕니다. A·B·C가 다르면 세 결과를 맞대어 맥락상 가장 자연스럽고 실제로 말했을 법한 쪽을 택합니다 (두 결과가 같으면 그쪽이 맞을 가능성이 큽니다). C에만 있는 엉뚱한 문장(예: 방송 자막 같은 말)은 버립니다.
 - speaker는 참석자 명단의 정확한 이름 중 하나로 씁니다. 판단 근거 우선순위: 현장 화자 기록(가장 신뢰) > B의 화자 라벨 연속성 > 대화 맥락(예: "집사님은요?" 뒤에 답하는 사람).
 - 짧은 맞장구("아멘", "네", "맞아요")는 여러 사람이 동시에 한 것이면 speaker를 "여럿"으로 합니다. 누구인지 정말 알 수 없으면 "불확실".
 - t는 모임 시작 기준 초(숫자)입니다.
@@ -710,27 +718,30 @@ ${tr || '(녹음 없음)'}
   m.sermon = { ...(m.sermon || {}), summary: res }; await saveMeeting(m);
 }
 
-// ---------- 질문 준비: 질문마다 생각할 포인트 ----------
-const qprepSchema = obj({ items: { type: 'array', items: obj({ points: strArr, hint: str }) } });
+// ---------- 질문 준비: 설교 녹음에서 질문마다 답 · 인용 · 생각할 포인트 ----------
+const qprepSchema = obj({ items: { type: 'array', items: obj({ answer: str, quotes: strArr, points: strArr, hint: str }) } });
 async function runQuestionPrep(m, onText) {
   const qs = ensureQuestions(m); if (!qs.length) throw fatal('질문을 먼저 넣어 주세요. (주보를 올리거나 직접 추가)');
-  const p = m.prep || {}, s = m.sermon || {};
-  const res = await claudeJSON({ model: ENGINES[settings.engine].model, effort: 'high', maxTokens: 16000, schema: qprepSchema, system: SYS_BASE,
+  const p = m.prep || {}, s = m.sermon || {}, tr = sermonText(m);
+  const res = await claudeJSON({ model: ENGINES[settings.engine].model, effort: 'high', maxTokens: 24000, schema: qprepSchema, system: SYS_BASE,
     content: [{ type: 'text', text: `${groupInfo()}
 
-순장이 순모임을 준비합니다. 아래 나눔 질문마다, 순장이 미리 생각해 볼 거리를 만들어 주세요.
+순장이 순모임을 준비합니다. 아래 나눔 질문마다, 오늘 설교에서 찾은 답과 순장이 미리 생각해 볼 거리를 만들어 주세요.
 
 [오늘 설교] ${p.sermon_title || ''} (${p.scripture || ''})
 ${s.summary ? `핵심: ${s.summary.main_message}\n대지: ${s.summary.points.map(x => x.heading + ' - ' + x.detail).join(' / ')}\n적용: ${s.summary.applications.join(' / ')}` : ''}
 ${s.notes?.trim() ? `[순장이 설교 중 적은 메모]\n${s.notes}` : ''}
+${tr ? `[설교 녹음을 받아 적은 글 — 음성인식이라 틀린 단어가 있을 수 있으니 문맥과 성경에 맞게 바로잡아 이해하세요]\n${tr}` : ''}
 
-[나눔 질문]
+[나눔 질문 (주보)]
 ${qs.map((x, i) => `${i + 1}. ${x.q}`).join('\n')}
 
 질문 순서 그대로 items를 만들어 주세요 (질문 ${qs.length}개 = items ${qs.length}개).
+- answer: 이 질문에 대해 오늘 설교가 말한 답을 3~5문장으로. 설교자가 실제로 전한 내용(녹음·메모)에만 근거하고, 설교에 없는 해석을 더하지 않습니다. 질문이 개인의 경험을 묻는 질문이면, 설교가 그 질문과 관련해 준 관점·권면을 정리합니다. 설교에서 직접 다루지 않았으면 "설교에서 직접 다루지 않았어요."로 시작하고 본문 말씀에 비춘 짧은 방향만 적습니다.
+- quotes: 이 질문과 관련해 설교에서 나온 핵심 문장이나 성경 구절 0~2개 (녹음에 있는 표현을 살려서, 짧게).
 - points: 2~3개의 짧은 생각할 포인트. 설교 내용(특히 순장의 메모)과 연결하고, 마음·감정과 실생활 적용 쪽으로. 가르치는 말투가 아니라 스스로 돌아보게 하는 말투.
 - hint: 순장이 먼저 나눌 때 참고할 답변 방향 한두 문장 (일상적인 소재로, 깊은 고백을 요구하지 않게).` }], onText });
-  res.items.forEach((it, i) => { if (qs[i]) { qs[i].points = it.points; qs[i].hint = it.hint; } });
+  res.items.forEach((it, i) => { if (qs[i]) Object.assign(qs[i], { answer: it.answer, quotes: it.quotes, points: it.points, hint: it.hint }); });
   await saveMeeting(m);
 }
 
@@ -1822,7 +1833,8 @@ const View = {
     $('#sNotes').oninput = e => { m.sermon = { ...(m.sermon || {}), notes: e.target.value }; clearTimeout(View._sn);
       View._sn = setTimeout(async () => { await saveMeeting(m); const el = $('#sSaved'); if (el) el.textContent = '저장됨 ✓'; }, 700); };
     $('#sRec').onclick = async () => {
-      if (recS) { await Rec.stop(); View.render(); return; }
+      // 설교 녹음을 멈추면 받아 적기가 끝나는 대로 설교 정리 + 질문 답까지 자동으로
+      if (recS) { await Rec.stop(); View.render(); if (settings.anthropicKey) View.summarizeSermon(); return; }
       if (Rec.on) return toast('나눔 녹음이 켜져 있어요. 먼저 멈춰 주세요');
       if (!settings.groqKey && !settings.openaiKey) return toast('설정에서 Groq 키를 먼저 넣어 주세요');
       try { await Rec.start(m, 'sermon'); View.render(); } catch (e) { Rec.active = false; toast('마이크를 쓸 수 없어요: ' + e.message, 5000); }
@@ -1853,7 +1865,12 @@ const View = {
       }
       if ($('#sSum')) $('#sSum').innerHTML = '<span class="spin"></span> 설교를 정리하는 중… (30초쯤)';
       await runSermonSummary(m);
-      toast('설교를 정리했어요');
+      // 주보 질문이 있으면 이어서 질문마다 설교에서 찾은 답을 만든다 (나눔 진행용)
+      if (ensureQuestions(m).length) {
+        if ($('#sSum')) $('#sSum').innerHTML = '<span class="spin"></span> 질문마다 설교에서 답을 찾는 중… (1분쯤)';
+        await runQuestionPrep(m);
+        toast('설교 정리와 질문 답을 만들었어요. ② 질문 준비에서 보세요', 5000);
+      } else toast('설교를 정리했어요');
     } catch (e) { toast('실패: ' + e.message, 6000); }
     finally { View._sermonRunning = false; if (current === m && tab === 'sermon') View.render(); }
   },
@@ -1867,14 +1884,13 @@ const View = {
           <button class="small" id="rdOpen" style="margin-top:10px">크게 보기</button></details>` : ''}
       ${p?.lead_tip ? `<div class="say">${esc(p.lead_tip)}</div>` : ''}
       <div class="card flat">
-        <div class="sec-h"><h2>질문 준비</h2>${qs.length ? `<button class="small primary" id="qAi">✨ 생각할 포인트</button>` : ''}</div>
-        <p class="muted" style="margin:0">${qs.length ? `질문마다 내 생각을 적어 두면, 나눔 때 질문과 함께 보여 드려요.${m.sermon?.notes || m.sermon?.summary ? ' "생각할 포인트"는 설교 노트를 바탕으로 만들어요.' : ''}` : '주보를 올리면 나눔 질문이 자동으로 들어와요. 직접 추가해도 돼요.'}</p>
+        <div class="sec-h"><h2>질문 준비</h2>${qs.length ? `<button class="small primary" id="qAi">${qs.some(x => x.answer) ? '✨ 답 다시 만들기' : '✨ 설교로 답 만들기'}</button>` : ''}</div>
+        <p class="muted" style="margin:0">${qs.length ? `설교 녹음·노트에서 질문마다 답과 핵심 말씀을 찾아 드려요. 설교 녹음을 멈추면 자동으로 만들어요. 내 메모는 나눔 때 질문과 함께 보여 드려요.` : '주보를 올리면 나눔 질문이 자동으로 들어와요. 직접 추가해도 돼요.'}</p>
         <p class="stream" id="qStream" style="margin:6px 0 0"></p>
       </div>
       ${qs.map((x, i) => `<div class="card">
         <div class="sec-h"><span class="num">${i + 1}</span><h2 style="margin:0;flex:1">${esc(x.q)}</h2></div>
-        ${x.points?.length ? `<ul class="points">${x.points.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
-        ${x.hint ? `<div class="hintbox"><b>답변 방향</b>${esc(x.hint)}</div>` : ''}
+        ${qAnswerHTML(x)}
         <label class="f" for="qn${i}">내 메모</label>
         <textarea id="qn${i}" data-note="${i}" rows="3" placeholder="내 생각, 먼저 나눌 이야기를 적어 보세요">${esc(x.note || '')}</textarea>
         <div class="row" style="margin-top:6px;justify-content:flex-end"><button class="small ghost" data-qedit="${i}">질문 고치기</button><button class="small ghost" data-qdel="${i}">삭제</button></div>
@@ -1888,7 +1904,7 @@ const View = {
     $$('[data-qdel]').forEach(b => b.onclick = () => { const i = +b.dataset.qdel; if (!confirm(`${i + 1}번 질문${qs[i].note ? '과 적어 둔 메모' : ''}를 지울까요?`)) return; qs.splice(i, 1); saveMeeting(m); View.prep(); });
     $('#qAi')?.addEventListener('click', async () => {
       const b = $('#qAi'); b.disabled = true; b.innerHTML = '<span class="spin"></span> 만드는 중';
-      try { await runQuestionPrep(m, x => { if ($('#qStream')) $('#qStream').textContent = `쓰는 중… ${x.length}자`; }); toast('생각할 포인트를 만들었어요'); }
+      try { await runQuestionPrep(m, x => { if ($('#qStream')) $('#qStream').textContent = `쓰는 중… ${x.length}자`; }); toast('질문마다 설교에서 찾은 답을 만들었어요'); }
       catch (e) { toast('실패: ' + e.message, 6000); }
       if (current === m && tab === 'prep') View.prep();
     });
@@ -1906,7 +1922,7 @@ const View = {
           <button class="recbtn ${recOn ? 'on' : ''}" id="recBtn" aria-label="${recOn ? '녹음 멈춤' : '녹음 시작'}">${recOn ? '멈춤' : started ? '이어서' : '시작'}</button>
           <div class="grow"><div class="timer" id="timer">${fmt(m.startedAt && recOn ? Date.now() - m.startedAt : lastEnd(m))}</div>
             <div class="meter" aria-hidden="true"><i id="${recOn ? 'meter' : 'meterOff'}"></i></div>
-            <div class="muted">${recOn ? (eng === 'free' ? '듣고 있어요 · 약 1분마다 노트가 채워져요' : '듣고 있어요 · 5분마다 노트가 채워져요') + (isPC() ? ' · 노트북 덮개는 열어 두세요' : '') : started ? '멈춰 있어요' : isPC() ? '노트북을 테이블 가운데에 두고 시작하세요' : '폰을 테이블 가운데에 두고 시작하세요'}</div></div>
+            <div class="muted">${recOn ? (eng === 'free' ? '듣고 있어요 · 약 1분마다 노트가 채워져요' : '듣고 있어요 · 2분마다 노트가 채워져요') + (isPC() ? ' · 노트북 덮개는 열어 두세요' : '') : started ? '멈춰 있어요' : isPC() ? '노트북을 테이블 가운데에 두고 시작하세요' : '폰을 테이블 가운데에 두고 시작하세요'}</div></div>
         </div>
         ${!started && !recOn ? '<p class="muted" style="margin:12px 0 0">시작하기 전에 순원들께 녹음 양해를 구해 주세요.</p>' : ''}
         ${!recOn ? `<div class="row" style="margin-top:12px;flex-wrap:wrap">${isPC() ? '<button class="small" id="micBtn">🎤 <span id="micNow">마이크 확인</span></button>' : ''}${importBtn('imp')}</div>
@@ -1965,8 +1981,7 @@ const View = {
         <div class="sec-h"><span class="pill">질문 ${i + 1} / ${n}</span><span class="kbd" style="margin-left:auto">← → 키로 넘기기</span></div>
         <div class="qtext">${esc(x.q)}</div>
         ${x.note?.trim() ? `<div class="mynote"><b>내 메모</b>${esc(x.note)}</div>` : `<div class="muted" style="margin-bottom:10px">적어 둔 메모가 없어요 · <a href="#" id="qGoPrep">질문 준비에서 적기</a></div>`}
-        ${x.points?.length || x.hint ? `<details style="margin:10px 0 4px"><summary style="font-size:15px">생각할 포인트</summary>
-          ${x.points?.length ? `<ul class="points">${x.points.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}${x.hint ? `<div class="hintbox"><b>답변 방향</b>${esc(x.hint)}</div>` : ''}</details>` : ''}
+        ${x.answer || x.points?.length || x.hint ? `<details style="margin:10px 0 4px" ${x.answer ? 'open' : ''}><summary style="font-size:15px">${x.answer ? '📖 설교에서 찾은 답' : '생각할 포인트'}</summary>${qAnswerHTML(x)}</details>` : ''}
         <div class="row" style="margin-top:10px"><button id="qPrev" ${i === 0 ? 'disabled' : ''}>‹ 이전</button><button class="primary grow" id="qNext">${i === n - 1 ? '기도제목 나눔 ›' : '다음 질문 ›'}</button></div>
       </div>`;
     }
@@ -2260,6 +2275,13 @@ function bindImport(id, kind) {
   b.onclick = () => f.click();
   f.onchange = () => { const files = [...f.files]; f.value = ''; View.importFiles(kind, files); };
 }
+// 질문 하나에 대한 설교 속 답 · 핵심 말씀 · 생각할 포인트 · 내가 나눌 방향
+function qAnswerHTML(x) {
+  return (x.answer ? `<div class="mynote" style="margin-top:8px"><b>📖 설교에서 찾은 답</b>${esc(x.answer)}</div>` : '') +
+    (x.quotes?.length ? x.quotes.map(k => `<div class="say" style="margin:6px 0">“${esc(k)}”</div>`).join('') : '') +
+    (x.points?.length ? `<ul class="points">${x.points.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : '') +
+    (x.hint ? `<div class="hintbox"><b>내가 먼저 나눌 방향</b>${esc(x.hint)}</div>` : '');
+}
 function sermonCard(x) {
   return `<div class="card accent"><h2>✨ 설교 정리</h2>
     <p style="font-size:18px;font-weight:700;line-height:1.6">${esc(x.main_message)}</p>
@@ -2292,7 +2314,7 @@ function mdText(m) {
     if (sm.notes?.trim()) md += `### 내 메모\n${sm.notes.trim()}\n\n`;
   }
   const qs = m.questions?.length ? m.questions : qList(m).map(q => ({ q }));
-  if (qs.length) md += `## 나눔 질문 준비\n${qs.map((x, i) => `### ${i + 1}. ${x.q}\n` + (x.points?.length ? x.points.map(t => `- ${t}`).join('\n') + '\n' : '') + (x.hint ? `- 답변 방향: ${x.hint}\n` : '') + (x.note?.trim() ? `\n**내 메모:** ${x.note.trim()}\n` : '')).join('\n')}\n`;
+  if (qs.length) md += `## 나눔 질문 준비\n${qs.map((x, i) => `### ${i + 1}. ${x.q}\n` + (x.answer ? `**설교에서 찾은 답:** ${x.answer}\n` : '') + (x.quotes?.length ? x.quotes.map(k => `> ${k}`).join('\n') + '\n' : '') + (x.points?.length ? x.points.map(t => `- ${t}`).join('\n') + '\n' : '') + (x.hint ? `- 답변 방향: ${x.hint}\n` : '') + (x.note?.trim() ? `\n**내 메모:** ${x.note.trim()}\n` : '')).join('\n')}\n`;
   if (f) md += `## 한 명씩\n${f.flow}\n\n${f.people.map(p => `### ${p.name}\n${p.summary}\n${(p.prayer_requests || []).map(r => `- 🙏 ${r}`).join('\n')}`).join('\n\n')}\n\n## 마무리 기도 진행\n${f.closing.how_to}\n\n## 마무리 기도\n${f.closing.leader_prayer}\n\n## 카톡\n${m.kakao ?? buildKakao(m)}\n\n`;
   md += `## ${m.mode === 'notes' ? '메모' : '전사록'}\n${transcriptText(m)}\n`;
   return md;
