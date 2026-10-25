@@ -44,12 +44,15 @@ const isPC = () => !isPhone() && !isIOS();
 const extOf = mime => mime.includes('wav') ? 'wav' : mime.includes('mp4') ? 'mp4' : 'webm';
 
 // ---------- 설정 (localStorage) ----------
-const SKEY = 'soonnote.settings.v1';
+// 순원 화면은 주소를 따로 둔다(…/member/). 같은 사이트라도 저장 공간을 나눠 순장 기록·모드와 섞이지 않게 한다
+const MEMBER_PAGE = /\/member\/(index\.html)?$/.test(location.pathname);
+const SKEY = MEMBER_PAGE ? 'soonnote.member.settings.v1' : 'soonnote.settings.v1';
+const DBNAME = MEMBER_PAGE ? 'soonnote-member' : 'soonnote';
 function loadSettings() {
   let s = {}; try { s = JSON.parse(localStorage.getItem(SKEY) || '{}'); } catch {}
   return Object.assign({ engine: 'free', groqKey: '', openaiKey: '', anthropicKey: '', groupName: '', members: [], leader: '', context: '', keywords: '',
     segMin: 5, audioDays: 28, pinHash: '', pinSalt: '',
-    role: 'leader', member: null, memberName: '', collect: { url: '', key: '', token: '' } }, s);
+    role: 'leader', member: null, memberName: '', collect: { url: '', key: '', token: '' } }, s, { role: MEMBER_PAGE ? 'member' : 'leader' });
 }
 function saveSettings(s) { try { localStorage.setItem(SKEY, JSON.stringify(s)); } catch {} }
 let settings = loadSettings();
@@ -70,7 +73,7 @@ const initials = name => (name || '?').length >= 3 ? name.slice(-2) : name || '?
 
 // ---------- IndexedDB ----------
 const dbp = new Promise((ok, no) => {
-  const r = indexedDB.open('soonnote', 2);
+  const r = indexedDB.open(DBNAME, 2);
   r.onupgradeneeded = () => { const d = r.result;
     if (!d.objectStoreNames.contains('meetings')) d.createObjectStore('meetings', { keyPath: 'id' });
     if (!d.objectStoreNames.contains('audio')) d.createObjectStore('audio');
@@ -1109,10 +1112,11 @@ const Collect = {
     catch { throw new Error('불러오지 못했어요. 인터넷 연결을 확인해 주세요.'); }
     return (await this.parse(r)).rows || [];
   },
-  joinLink() { const c = this.keys(); return appBase() + '?join=' + b64url(JSON.stringify({ v: 1, g: settings.groupName || '순모임', u: c.url, t: c.token })); },
+  joinLink() { const c = this.keys(); return memberBase() + '?join=' + b64url(JSON.stringify({ v: 1, g: settings.groupName || '순모임', u: c.url, t: c.token })); },
 };
-const appBase = () => location.origin + location.pathname.replace(/index\.html$/, '');
-const memberJoinLink = () => { const j = settings.member; return appBase() + '?join=' + b64url(JSON.stringify({ v: 1, g: j.g, u: j.u, t: j.t })); };
+const appBase = () => location.origin + location.pathname.replace(/index\.html$/, '').replace(/member\/$/, '');
+const memberBase = () => appBase() + 'member/';
+const memberJoinLink = () => { const j = settings.member; return memberBase() + '?join=' + b64url(JSON.stringify({ v: 1, g: j.g, u: j.u, t: j.t })); };
 function parseJoin(text) {
   const mm = String(text || '').match(/[?&]join=([\w-]+)/); if (!mm) return null;
   try { const o = JSON.parse(b64urlDecode(mm[1])); if (o?.v === 1 && SCRIPT_URL_RE.test(o.u) && o.t) return o; } catch {}
@@ -1317,7 +1321,7 @@ const View = {
     $('#pinForgot').onclick = async () => {
       if (!confirm('PIN을 잊으면 이 기기의 모든 모임 기록·녹음·설정을 지우고 처음부터 시작해야 해요. 지울까요?')) return;
       if (!confirm('정말 모두 지울까요? 되돌릴 수 없습니다.')) return;
-      localStorage.removeItem(SKEY); (await dbp).close(); indexedDB.deleteDatabase('soonnote'); setTimeout(() => location.reload(), 300);
+      localStorage.removeItem(SKEY); (await dbp).close(); indexedDB.deleteDatabase(DBNAME); setTimeout(() => location.reload(), 300);
     };
   },
 
@@ -1340,7 +1344,7 @@ const View = {
           <div class="title">2분이면 준비돼요</div>
           <button class="primary big" id="goWiz">설정 시작하기 (순장)</button>
           <button class="ghost" id="goLink" style="margin-top:6px">🔗 다른 기기에서 쓰던 기록 연결하기</button>
-          <button class="ghost" id="goJoin" style="margin-top:6px">순원이에요 · 참여 링크 붙여넣기</button>
+          <button class="ghost" id="goJoin" style="margin-top:6px">순원이에요 · 순원 화면 열기</button>
         </div>` : `<div class="card hero">
           <div class="date">${krDate(today())}</div>
           <div class="title">${ongoing ? '진행 중인 모임이 있어요' : '오늘 순모임'}</div>
@@ -1378,7 +1382,7 @@ const View = {
           : '<p class="muted">아직 기록이 없어요.</p>'}
       </div>`;
     $('#goWiz')?.addEventListener('click', () => View.wizard(1));
-    $('#goJoin')?.addEventListener('click', () => View.joinPaste());
+    $('#goJoin')?.addEventListener('click', () => location.assign(memberBase()));
     $('#goLink')?.addEventListener('click', () => View.joinPaste('link'));
     $('#goKeys')?.addEventListener('click', () => View.wizard(2));
     $('#syncPaste')?.addEventListener('click', () => View.joinPaste('link'));
@@ -1399,6 +1403,7 @@ const View = {
   // ================= 순원 모드 (QR로 참여한 순원의 노트) =================
   async memberHome() {
     current = null; tab = ''; setHeader(settings.member?.g || '순모임 노트', false); dock();
+    if (!settings.member) return View.joinPaste();
     if (!settings.memberName) return View.memberSetup();
     const list = (await allMeetings()).filter(m => m.mode === 'member').sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
     const todayNote = list.find(m => m.date === today());
@@ -1487,14 +1492,12 @@ const View = {
       ${Install.needed() ? `<div class="card flat">${Install.button()}</div>` : ''}
       <div class="card flat"><h2>순원 모드</h2>
         <p class="muted">노트는 이 기기에만 저장되고, 기도제목만 "보내기"를 누를 때 순장님 구글 시트로 전달돼요.</p>
-        <button class="danger" id="msLeave">${hasLeaderSetup() ? '순장 모드로 돌아가기' : '순원 모드 끝내기'}</button></div>`;
+        <p class="muted">순장님 화면은 주소가 따로 있어요.</p>
+        <button id="msLeave">순장 화면 열기</button></div>`;
     dock(`<button class="primary big" id="msSave">저장</button>`, d => $('#msSave', d).onclick = () => {
       const n = $('#msName').value.trim(); if (!n) return toast('이름을 적어 주세요');
       settings.memberName = n; saveSettings(settings); toast('저장했어요'); View.home(); });
-    $('#msLeave').onclick = () => {
-      if (!confirm(hasLeaderSetup() ? '순장 모드로 돌아갈까요? (순원 노트는 그대로 남아요)' : '순원 모드를 끝낼까요? (적어 둔 노트는 그대로 남아요)')) return;
-      settings.role = 'leader'; saveSettings(settings); View.home();
-    };
+    $('#msLeave').onclick = () => location.assign(appBase());
   },
   // 순장: 순원 초대 QR
   showQR() {
@@ -1548,6 +1551,8 @@ const View = {
         <button id="jpGo" style="margin-top:8px">참여하기</button></div>`;
     const go = t => {
       const l = Link.parse(t);
+      // 순원 화면에 기기 연결 링크를 넣으면 순장 화면에서 연결한다
+      if (l && MEMBER_PAGE) return location.assign(appBase() + String(t).slice(String(t).indexOf('#')));
       if (l) { Link.apply(l, t); toast('연결됐어요. 기록을 가져오는 중이에요…', 4000); View.home(); Sync.run(true); return; }
       const j = !lk && parseJoin(t);
       if (!j) return toast(lk ? '연결 링크가 아니에요. 링크 전체를 복사해 주세요' : '참여 링크가 아니에요. 순장님께 QR을 다시 받아 주세요', 5000);
@@ -2382,7 +2387,7 @@ document.addEventListener('keydown', e => {
 $('#backBtn').onclick = () => { if (Rec.on) return toast('녹음 중이에요. 먼저 멈춰 주세요'); View.home(); };
 $('#settingsBtn').onclick = () => { if (Rec.on) return toast('녹음 중에는 설정을 열 수 없어요'); View.settings(); };
 window.addEventListener('beforeunload', e => { if (Rec.on) { e.preventDefault(); e.returnValue = ''; } });
-if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register(new URL('sw.js', import.meta.url)).catch(() => {});
 navigator.storage?.persist?.().catch(() => {});   // 폰이 저장소를 임의로 비우지 않도록 요청
 purgeOldAudio().catch(console.error);
 retrySweep().catch(console.error);
@@ -2394,12 +2399,15 @@ addEventListener('storage', e => {
   if (Rec.on || locked) return;
   if (!current && $('#sGn')) { View.settings(); toast('다른 탭에서 바꾼 설정을 불러왔어요'); } else View.homeIfShown();
 });
-{ const j = parseJoin(location.search);
+// 순원 초대 링크는 순원 주소로, 기기 연결 링크는 순장 주소로 옮겨 연다 (예전에 보낸 링크도)
+const moveTo = !MEMBER_PAGE && /[?&]join=/.test(location.search) ? memberBase() + location.search
+  : MEMBER_PAGE && location.hash.includes('link=') ? appBase() + location.hash : '';
+if (moveTo) location.replace(moveTo);
+if (MEMBER_PAGE) { const j = parseJoin(location.search);
   // 즐겨찾기·바탕화면 앱이 언제나 같은 주소로 열리도록 참여 정보는 주소에서 지운다
-  if (j) history.replaceState(null, '', location.pathname + location.hash);
-  if (j &&(settings.role === 'member' || !hasLeaderSetup() || confirm('순원 초대 링크예요. 이 기기를 순원 모드로 바꿀까요? (순장 설정은 그대로 남아요)'))) applyJoin(j); }
+  if (j) { history.replaceState(null, '', location.pathname + location.hash); applyJoin(j); } }
 // 다른 기기에서 보낸 연결 링크로 열었을 때 (주소에서는 바로 지운다)
-if (location.hash.includes('link=')) {
+if (!MEMBER_PAGE && location.hash.includes('link=')) {
   const href = location.href, o = Link.parse(location.hash);
   history.replaceState(null, '', location.pathname + location.search);
   if (!o) toast('연결 링크가 잘렸어요. 링크 전체를 다시 열어 주세요', 5000);
