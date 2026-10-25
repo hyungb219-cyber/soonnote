@@ -2416,8 +2416,8 @@ if (!MEMBER_PAGE && location.hash.includes('link=')) {
 }
 View.home();
 if (settings.role !== 'member') Folder.init().then(() => View.homeIfShown()).catch(console.error).finally(() => Sync.run());
-// 다른 기기 기록: 앱으로 돌아올 때, 인터넷이 돌아올 때, 열어 둔 동안 3분마다 맞춘다 (녹음 중에는 올리기만)
+// 다른 기기 기록: 앱으로 돌아올 때, 인터넷이 돌아올 때, 열어 둔 동안 1분마다 맞춘다 (녹음 중에는 올리기만)
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !Rec.on && Date.now() - Sync.lastRun > 30000) Sync.run(); });
 addEventListener('online', () => Sync.run());
-setInterval(() => { if (document.visibilityState === 'visible' && !Rec.on) Sync.run(); }, 3 * 60000);
+setInterval(() => { if (document.visibilityState === 'visible' && !Rec.on) Sync.run(); }, 60000);
 if (location.hostname === 'localhost') window.__soon = { Folder, Sync, allMeetings, getMeeting, saveMeeting, putAudio, getAudio, Rec };   // 로컬 테스트용
