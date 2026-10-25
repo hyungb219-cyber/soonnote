@@ -707,7 +707,9 @@ async function runPrep(m, files, onText) {
 }
 
 // ---------- 설교 정리 (내 메모 + 설교 녹음) ----------
-const sermonText = m => (m.sermonSegs || []).flatMap(s => s.utterances || []).sort((a, b) => a.t - b.t).map(u => u.text).join(' ');
+// 설교 녹음을 받아 적은 글 + 유튜브 스크립트(자막)를 붙여넣은 글 (타임스탬프 줄은 빼고)
+const sermonText = m => [(m.sermonSegs || []).flatMap(s => s.utterances || []).sort((a, b) => a.t - b.t).map(u => u.text).join(' '),
+  (m.sermon?.script || '').split('\n').map(l => l.trim()).filter(l => l && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(l)).join(' ')].filter(Boolean).join('\n\n');
 const sermonSchema = obj({ title: str, scripture: str, main_message: str,
   points: { type: 'array', items: obj({ heading: str, detail: str }) }, key_verses: strArr, applications: strArr });
 async function runSermonSummary(m, onText) {
@@ -840,7 +842,7 @@ async function fileBaseOf(m) {
 }
 const meetingFileJSON = m => JSON.stringify({ type: 'soonnote-meeting', version: 1, meeting: m }, null, 1);
 async function writeText(dir, name, text) { const fh = await dir.getFileHandle(name, { create: true }); const w = await fh.createWritable(); await w.write(text); await w.close(); }
-const hasContent = m => m.prep || m.final || m.sermon?.notes?.trim() || m.sermon?.summary || m.questions?.some(q => q.note?.trim()) || (m.rawNotes || '').trim() || allSegs(m).some(s => s.utterances?.length);
+const hasContent = m => m.prep || m.final || m.sermon?.notes?.trim() || m.sermon?.script?.trim() || m.sermon?.summary || m.questions?.some(q => q.note?.trim()) || (m.rawNotes || '').trim() || allSegs(m).some(s => s.utterances?.length);
 
 const Folder = {
   main: null, inbox: null, ok: { main: false, inbox: false }, timers: {},
@@ -1821,6 +1823,10 @@ const View = {
         <textarea id="sNotes" rows="10" placeholder="들으면서 마음에 남는 말씀, 기억하고 싶은 문장, 떠오르는 생각을 적어 보세요." aria-label="설교 노트">${esc(s.notes || '')}</textarea>
         <p class="hint">적는 대로 자동 저장돼요. 질문 준비 때 이 메모를 바탕으로 생각할 거리를 만들어 드려요.</p>
       </div>
+      <details class="card flat" ${s.script ? 'open' : ''}><summary>📺 유튜브 설교 글(스크립트) 붙여넣기 ${s.script ? `<span class="pill">${s.script.length.toLocaleString()}자</span>` : ''}</summary>
+        <p class="muted" style="margin:8px 0">예배 영상이 끝난 뒤 유튜브 영상 설명의 <b>"스크립트 표시"</b>를 눌러 나온 글을 모두 복사해 붙여넣으면, 녹음 없이도 설교 정리와 질문 답을 만들어요.</p>
+        <textarea id="sScript" rows="6" placeholder="유튜브 스크립트(자막) 글" aria-label="유튜브 설교 스크립트">${esc(s.script || '')}</textarea>
+      </details>
       <div class="card flat"><div class="sec-h"><h2>🎙 설교 녹음</h2><span class="pill">선택</span></div>
         <div class="recbox">
           <button class="recbtn ${recS ? 'on' : ''}" id="sRec" style="width:68px;height:68px;font-size:15px" aria-label="${recS ? '설교 녹음 멈춤' : '설교 녹음 시작'}">${recS ? '멈춤' : sSegs.length ? '이어서' : '녹음'}</button>
@@ -1853,6 +1859,7 @@ const View = {
         toast('주보를 읽었어요. 질문과 시작 기도가 준비됐어요'); setHeader(`${shortDate(m.date)} ${m.title || '주일 노트'}`, true); View.render(); }
       catch (err) { st.textContent = '실패: ' + err.message; }
     };
+    $('#sScript').oninput = e => { m.sermon = { ...(m.sermon || {}), script: e.target.value }; clearTimeout(View._ss); View._ss = setTimeout(() => saveMeeting(m), 700); };
     $('#sNotes').oninput = e => { m.sermon = { ...(m.sermon || {}), notes: e.target.value }; clearTimeout(View._sn);
       View._sn = setTimeout(async () => { await saveMeeting(m); const el = $('#sSaved'); if (el) el.textContent = '저장됨 ✓'; }, 700); };
     $('#sRec').onclick = async () => {
