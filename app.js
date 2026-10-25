@@ -822,9 +822,10 @@ const Folder = {
   },
   ready() { return !!(this.main && this.ok.main); },
   needsGrant() { return !!((this.main && !this.ok.main) || (this.inbox && !this.ok.inbox)); },
-  // 브라우저는 앱을 다시 열 때마다 폴더 권한을 한 번 확인한다 (버튼 클릭 필요)
+  // 크롬은 폴더 권한을 다시 물을 때 "방문할 때마다 허용"을 보여 준다. 그걸 고르면 다음부터 앱을 열어도 그대로 연결돼 있다.
   async grant() {
     for (const k of ['main', 'inbox']) if (this[k] && !this.ok[k]) this.ok[k] = (await this[k].requestPermission({ mode: this.mode(k) })) === 'granted';
+    if (this.ok.main) toast('폴더를 연결했어요. "방문할 때마다 허용"을 고르셨다면 다음부터는 묻지 않아요.', 5000);
     const n = await this.pullAll(); await this.pushAll(); return n;
   },
   async pick(kind) {
@@ -1325,7 +1326,7 @@ const View = {
         <button id="homeSyncNow">지금</button></div></div>` : ''}
       ${viewOnly ? `<div class="card flat"><div class="row"><div class="grow"><b>🔗 연결된 기기예요</b><div class="muted">다른 기기의 기록을 볼 수 있어요. 이 기기에서 녹음을 글로 바꾸거나 정리하려면 AI 키를 넣어 주세요.</div></div>
         <button id="goKeys">AI 키</button></div></div>` : ''}
-      ${Folder.needsGrant() ? `<div class="card warn"><div class="row"><div class="grow"><b>📁 저장 폴더 다시 연결</b><div class="muted">앱을 새로 열면 한 번 눌러 주셔야 해요.</div></div>
+      ${Folder.needsGrant() ? `<div class="card warn"><div class="row"><div class="grow"><b>📁 저장 폴더 다시 연결</b><div class="muted">연결을 누르고 크롬 창에서 <b>"방문할 때마다 허용"</b>을 고르면 다음부터는 묻지 않아요.</div></div>
         <button class="primary" id="grantDir">연결</button></div></div>` : ''}
       ${!setup && canPickFolder && !Folder.main && !isPhone() ? `<div class="card flat"><div class="row"><div class="grow"><b>📁 저장 폴더 연결 (노트북)</b><div class="muted">기록을 Google Drive 폴더에 자동 저장해요.</div></div>
         <button id="pickMain">선택</button></div></div>` : ''}
