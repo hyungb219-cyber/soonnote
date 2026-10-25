@@ -283,6 +283,7 @@ const Rec = {
     else { if (!m.startedAt) m.startedAt = Date.now(); m.status = 'recording'; await saveMeeting(m); }
     await this.lockScreenOn();
     this.newSegment();
+    setTimeout(() => { if (this.active && Mic.blocked(this.stream)) toast(Mic.BLOCKED, 12000); }, 1500);
     this.tick = setInterval(() => View.updateTimer(), 500);
     this.health = setInterval(() => this.check(), 2000);
   },
@@ -382,6 +383,9 @@ const Mic = {
   // 고른 마이크가 빠져 있으면 기본 마이크로 녹음한다
   constraint: () => settings.micId ? { deviceId: { ideal: settings.micId } } : {},
   label: d => d.deviceId === 'default' ? '기본 마이크 (Windows 설정) — ' + d.label.replace(/^(Default|기본값)\s*-\s*/i, '') : d.label || '마이크',
+  // 크롬은 허용했는데 Windows(마이크 끄기 키·개인 정보 설정)가 막으면 소리 없이 녹음된다
+  blocked: stream => !!stream?.getAudioTracks()[0]?.muted,
+  BLOCKED: '⚠️ Windows가 마이크를 막고 있어요 (소리가 0으로 들어와요). 노트북의 마이크 끄기 키(🎤 표시, 보통 F4 근처)를 눌러 풀거나, Windows 설정 → 개인 정보 및 보안 → 마이크 → "마이크 액세스"와 "데스크톱 앱이 마이크에 액세스하도록 허용"을 켜 주세요.',
   async current() { const ds = await this.list(); const d = ds.find(x => x.deviceId === (settings.micId || 'default')) || ds[0]; return d && d.label ? this.label(d) : ''; },
 };
 
@@ -2179,6 +2183,7 @@ const View = {
       iv = setInterval(() => {
         an.getFloatTimeDomainData(buf); let s = 0; for (const v of buf) s += v * v; const rms = Math.sqrt(s / buf.length);
         peak = Math.max(peak * 0.98, rms); const el = $('#micMeter'); if (el) el.style.width = Math.min(100, rms * 900) + '%';
+        if (Mic.blocked(stream)) return say(Mic.BLOCKED);
         say(peak > 0.02 ? '✅ 잘 들려요' : peak > 0.006 ? '조금 작게 들려요 · 마이크 가까이에서 말해 보세요' : '말해 보세요 · 막대가 움직이면 잘 들리는 거예요');
       }, 150);
       const ds = await Mic.list();
