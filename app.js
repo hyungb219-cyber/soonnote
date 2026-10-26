@@ -433,14 +433,7 @@ function cutPoints(pcm, minS, maxS) {
   }
   return cuts;
 }
-function wavBlob(f32) {
-  const n = f32.length, v = new DataView(new ArrayBuffer(44 + n * 2));
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, IMPORT_RATE, true); v.setUint32(28, IMPORT_RATE * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, f32[i])); v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true); }
-  return new Blob([v.buffer], { type: 'audio/wav' });
-}
+const wavBlob = f32 => wavAt(f32, IMPORT_RATE);
 async function importAudio(m, kind, files, say) {
   const sermon = kind === 'sermon', seg5 = PRECISE_SEG_MIN * 60;
   const [minS, maxS] = sermon ? [90, 180] : engineOf(m) === 'free' ? [ENGINES.free.minSeg / 1000, ENGINES.free.maxSeg / 1000] : [seg5 - 30, seg5];
@@ -468,6 +461,78 @@ async function importAudio(m, kind, files, say) {
   else { if (!m.startedAt) m.startedAt = Date.now() - at; m.status = 'recorded'; }
   await saveMeeting(m); Worker.kick(m.id);
   return { n, ms: at - start };
+}
+
+// ---------- 녹음 구간을 하나로 이어 mp4(AAC)로 저장 ----------
+// 구간끼리 겹친 부분(경계에서 말이 빠지지 않게 겹쳐 녹음한 몇 초)은 잘라 내고, "이어서" 녹음한 부분은 바로 붙인다.
+// 긴 모임도 메모리가 넘치지 않도록 구간 하나씩 풀어서 바로 압축한다.
+const EXPORT_RATE = 48000;
+async function pickEncoder() {
+  if (!window.AudioEncoder) return null;
+  for (const [codec, mux] of [['mp4a.40.2', 'aac'], ['opus', 'opus']]) {
+    const cfg = { codec, numberOfChannels: 1, sampleRate: EXPORT_RATE, bitrate: 96000 };
+    try { if ((await AudioEncoder.isConfigSupported(cfg)).supported) return { cfg, mux }; } catch {}
+  }
+  return null;
+}
+async function exportAudio(m, kind = 'share', say = () => {}) {
+  const segs = (kind === 'sermon' ? m.sermonSegs : m.segments || []).slice().sort((a, b) => a.startMs - b.startMs);
+  if (!segs.length) throw fatal('저장할 녹음이 없어요.');
+  if (m.audioPurged) throw fatal('녹음 파일은 보관 기간이 지나 지워졌어요.');
+  const enc = await pickEncoder();
+  const { Muxer, ArrayBufferTarget } = enc ? await import('./vendor/mp4-muxer.mjs') : {};
+  const target = enc && new ArrayBufferTarget();
+  const muxer = enc && new Muxer({ target, audio: { codec: enc.mux, numberOfChannels: 1, sampleRate: EXPORT_RATE }, fastStart: 'in-memory', firstTimestampBehavior: 'offset' });
+  let encErr = null;
+  const encoder = enc && new AudioEncoder({ output: (c, meta) => muxer.addAudioChunk(c, meta), error: e => encErr = e });
+  encoder?.configure(enc.cfg);
+  const wav = [], R = enc ? EXPORT_RATE : IMPORT_RATE;   // 이 기기가 AAC·Opus 압축을 못 하면 16kHz wav로
+  let cursor = -Infinity, written = 0, missing = 0;
+  for (const [i, s] of segs.entries()) {
+    say(`이어 붙이는 중… ${i + 1}/${segs.length} 구간`);
+    const blob = await getAudio(audioKey(m, s));
+    if (!blob?.size) { missing++; continue; }
+    let pcm;
+    try { pcm = (await new OfflineAudioContext(1, 1, R).decodeAudioData(await blob.arrayBuffer())).getChannelData(0); }
+    catch { missing++; continue; }
+    // 앞 구간과 겹친 앞부분은 빼기
+    const skip = Math.max(0, Math.round((cursor - s.startMs) / 1000 * R));
+    cursor = s.startMs + pcm.length / R * 1000;
+    if (skip >= pcm.length) continue;
+    pcm = pcm.subarray(skip);
+    if (!encoder) { wav.push(pcm.slice()); written += pcm.length; continue; }
+    for (let o = 0; o < pcm.length; o += EXPORT_RATE) {
+      const part = pcm.slice(o, o + EXPORT_RATE);
+      const ad = new AudioData({ format: 'f32', sampleRate: EXPORT_RATE, numberOfFrames: part.length, numberOfChannels: 1, timestamp: Math.round(written / EXPORT_RATE * 1e6), data: part });
+      encoder.encode(ad); ad.close(); written += part.length;
+      if (encoder.encodeQueueSize > 20) await new Promise(r => setTimeout(r, 0));
+      if (encErr) throw encErr;
+    }
+    await encoder.flush();
+  }
+  if (!written) { encoder?.close(); throw fatal('녹음 파일을 찾지 못했어요. 다른 기기에서 녹음한 모임이면 그 기기에서 저장해 주세요.'); }
+  say('파일 만드는 중…');
+  let blob, ext;
+  if (encoder) {
+    await encoder.flush(); encoder.close(); if (encErr) throw encErr;
+    muxer.finalize(); blob = new Blob([target.buffer], { type: 'audio/mp4' }); ext = 'mp4';
+  } else {
+    const all = new Float32Array(written); let o = 0; for (const p of wav) { all.set(p, o); o += p.length; }
+    blob = wavAt(all, R); ext = 'wav';
+  }
+  return { blob, ms: written / R * 1000, missing, ext, size: blob.size };
+}
+const audioExt = async () => (await pickEncoder()) ? 'mp4' : 'wav';
+// 저장 이름: 순모임노트_2026-10-26_나눔녹음.mp4 (기록 파일 이름과 나란히)
+const audioFileName = async (m, kind, ext) => `${await fileBaseOf(m)}_${kind === 'sermon' ? '설교' : '나눔'}녹음.${ext}`;
+// 16bit 모노 wav
+function wavAt(f32, rate) {
+  const n = f32.length, v = new DataView(new ArrayBuffer(44 + n * 2));
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, f32[i])); v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true); }
+  return new Blob([v.buffer], { type: 'audio/wav' });
 }
 
 // ---------- 구간 처리 워커 ----------
@@ -1970,8 +2035,9 @@ const View = {
             <div class="meter" aria-hidden="true"><i id="${recOn ? 'meter' : 'meterOff'}"></i></div>
             <div class="muted">${recOn ? (eng === 'free' ? '듣고 있어요 · 약 1분마다 노트가 채워져요' : '듣고 있어요 · 2분마다 노트가 채워져요') + (isPC() ? ' · 노트북 덮개는 열어 두세요' : '') : started ? '멈춰 있어요' : isPC() ? '노트북을 테이블 가운데에 두고 시작하세요' : '폰을 테이블 가운데에 두고 시작하세요'}</div></div>
         </div>
+        ${recOn && canSaveAudio() ? '<button class="small" id="stopSave" style="margin-top:12px">⏹ 멈추고 mp4로 저장</button>' : ''}
         ${!started && !recOn ? '<p class="muted" style="margin:12px 0 0">시작하기 전에 순원들께 녹음 양해를 구해 주세요.</p>' : ''}
-        ${!recOn ? `<div class="row" style="margin-top:12px;flex-wrap:wrap">${isPC() ? '<button class="small" id="micBtn">🎤 <span id="micNow">마이크 확인</span></button>' : ''}${importBtn('imp')}</div>
+        ${!recOn ? `<div class="row" style="margin-top:12px;flex-wrap:wrap">${isPC() ? '<button class="small" id="micBtn">🎤 <span id="micNow">마이크 확인</span></button>' : ''}${importBtn('imp')}${started && !m.audioPurged && canSaveAudio() ? '<button class="small" id="saveAudio">💾 녹음 mp4로 저장</button>' : ''}</div>
           <p class="muted" id="impStat" style="margin:8px 0 0;font-size:14px">${started ? '' : '폰 녹음 앱(음성 메모·삼성 녹음 등)으로 녹음했다면 그 파일을 불러와도 똑같이 정리돼요.'}</p>` : ''}
         ${p?.opening_prayer ? `<button class="small" id="rdOpen" style="margin-top:12px">🙏 시작 기도 크게 보기</button>` : ''}
       </div>
@@ -1988,6 +2054,8 @@ const View = {
       if (shareRec()) await Rec.stop(); View.go('sum'); View.startFinalWhenReady(); });
     $('#stopSermon')?.addEventListener('click', async () => { await Rec.stop(); View.render(); });
     $('#micBtn')?.addEventListener('click', () => View.micTest());
+    $('#stopSave')?.addEventListener('click', () => View.saveAudio(true));
+    $('#saveAudio')?.addEventListener('click', () => View.saveAudio(false));
     if ($('#micNow')) View.micName();
     bindImport('imp', 'share');
     $('#rdOpen')?.addEventListener('click', () => openReader('시작 기도', p.opening_prayer));
@@ -2009,6 +2077,37 @@ const View = {
       (m.memos = m.memos || []).push({ t: m.startedAt ? Date.now() - m.startedAt : 0, text: v }); $('#memo').value = ''; saveMeeting(m); toast('메모했어요'); };
     $('#memoBtn').onclick = addMemo; $('#memo').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) addMemo(); };
     View.qcard(); View.refreshLive();
+  },
+  // 나눔 녹음 전체를 한 파일(mp4)로 내려받기. stopFirst면 녹음을 먼저 멈추고 마지막 구간이 저장되길 기다린다
+  // 나눔 녹음 전체를 한 파일(mp4)로 저장한다.
+  // 이 컴퓨터 크롬에서 설정의 "저장 폴더"로만 저장한다 (주차 폴더 "10 26" 안). 다운로드·다른 위치 저장은 하지 않는다.
+  // 폴더 허락 창은 버튼을 누른 직후에만 열 수 있어서, 녹음을 멈추고 파일을 만들기 전에 먼저 확인한다.
+  async saveAudio(stopFirst) {
+    const m = current; if (View._saving || !canSaveAudio()) return; View._saving = true;
+    const say = t => { const el = $('#impStat'); if (el) el.textContent = t; };
+    try {
+      if (!Folder.ok.main) await Folder.grant();
+      if (!Folder.ready()) return toast('설정 → 저장 폴더 연결을 허락해야 저장할 수 있어요', 5000);
+      const ext = await audioExt(), fname = await audioFileName(m, 'share', ext), dirName = dirNameOf(m);
+      if (stopFirst && shareRec()) {
+        await Rec.stop(); View.render(); say('녹음을 마무리하는 중…');
+        // 마지막 구간(과 겹쳐 녹음되던 앞 구간)이 저장될 때까지 기다린다
+        for (let i = 0; i < 40 && (m.segments || []).some(s => s.status === 'recording'); i++) await sleep(250);
+      }
+      if (Rec.on && Rec.meeting === m && Rec.kind === 'share') return toast('녹음을 먼저 멈춰 주세요');
+      const r = await exportAudio(m, 'share', say);
+      say('저장 폴더에 쓰는 중…');
+      // 녹음하는 동안 폴더 연결이 바뀌었으면 저장하지 않는다
+      if (!Folder.ready()) throw new Error('저장 폴더 연결이 풀렸어요. 설정에서 다시 연결해 주세요');
+      const dir = await Folder.main.getDirectoryHandle(dirName, { create: true });
+      const fh = await dir.getFileHandle(fname, { create: true });
+      const w = await fh.createWritable();
+      try { await w.write(r.blob); await w.close(); } catch (e) { await w.abort().catch(() => {}); throw e; }
+      const where = `${Folder.main.name}\\${dirName}\\${fname}`;
+      say(`✅ ${fmt(r.ms)} 분량 저장 (${(r.size / 1e6).toFixed(1)}MB) → ${where}${r.missing ? ` · ${r.missing}구간은 파일이 없어 빠졌어요` : ''}${r.ext === 'wav' ? ' · 이 브라우저는 mp4를 만들 수 없어 wav로 저장했어요' : ''}`);
+      toast('녹음 파일을 저장 폴더에 저장했어요', 4000);
+    } catch (e) { console.error(e); say(''); toast('녹음을 저장하지 못했어요: ' + e.message, 6000); }
+    finally { View._saving = false; }
   },
   // 지금 나누는 질문 카드: 질문 + 내가 적은 메모 + 생각할 포인트, 이전/다음으로 넘긴다 (마지막은 기도제목 나눔)
   qcard() {
@@ -2306,6 +2405,9 @@ const View = {
   },
 };
 const shareRec = () => Rec.on && Rec.kind === 'share';
+// 녹음 파일 저장은 순장 화면 + 노트북 크롬 + 설정에 저장 폴더가 연결된 이 기기에서만 보인다.
+// (순원 화면 /member/, 폰, 폴더를 연결하지 않은 다른 기기에는 버튼이 없다. 폴더 연결은 이 브라우저에만 저장된다)
+const canSaveAudio = () => !MEMBER_PAGE && settings.role !== 'member' && canPickFolder && isPC() && !!Folder.main;
 // 노트북 크롬: 다른 탭(유튜브) 소리 녹음이 되는지
 const canTabRec = () => isPC() && !!navigator.mediaDevices?.getDisplayMedia;
 // 나눔 녹음(또는 녹음 파일 불러오기) 전에 한 번 순원들의 동의를 확인한다
